@@ -50,7 +50,7 @@ Once the process finishes, you will see a new folder named `dist`. Open it, and 
 | Feature | Details |
 |---|---|
 | **Auto-Save** | Triggers 1sec. after typing stops if >5 chars changed. |
-| **Manual Save** | Ctrl + S —  Force-save with a discrete "Saved" popup. |
+| **Manual Save** | `Ctrl + S` —  Force-save with a discrete "Saved" popup. |
 | **Portable** | Notes are stored in `notes_vault.db` in the same folder as the app. |
 | **Search** | `Ctrl + F` — Instantly find specific entries within your history notes. |
 | **Timestamp** | `Ctrl + T` — Inserts a current date and time stamp into your note. |
