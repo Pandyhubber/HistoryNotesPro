@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['notes4.py'],
+    ['notes.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='notes4',
+    name='notes',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

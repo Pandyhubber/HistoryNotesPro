@@ -34,7 +34,8 @@ class HistoryNotes(ctk.CTk):
                 "lang_btn": "Sprache: DE", "menu_file": "Datei", "export": "Export (.zip)", 
                 "import": "Import (.txt/.zip)", "stats": "Wörter: {} | Zeichen: {}", 
                 "confirm_del": "Notiz wirklich endgültig löschen?", "history_label": "Versionsverlauf",
-                "menu_file_label": "Datei", "saved": "Gespeichert"
+                "menu_file_label": "Datei", "saved": "Gespeichert", "new_note_default": "Neue Notiz",
+                "welcome_title": "Willkommen!", "welcome_text": "Dies ist deine erste Notiz.\n\nDu kannst diesen Text einfach löschen oder oben auf '+ Neue Notiz' klicken."
             },
             "EN": {
                 "title": "HistoryNotes PRO", "new": "+ New Note", "del": "Archive", "final_del": "Delete Permanently",
@@ -42,7 +43,8 @@ class HistoryNotes(ctk.CTk):
                 "lang_btn": "Language: EN", "menu_file": "File", "export": "Export (.zip)", 
                 "import": "Import (.txt/.zip)", "stats": "Words: {} | Chars: {}", 
                 "confirm_del": "Delete note permanently?", "history_label": "History Version",
-                "menu_file_label": "File", "saved": "Saved"
+                "menu_file_label": "File", "saved": "Saved", "new_note_default": "New Note",
+                "welcome_title": "Welcome!", "welcome_text": "This is your first note.\n\nYou can simply edit this text or click '+ New Note' above."
             }
         }
 
@@ -53,7 +55,6 @@ class HistoryNotes(ctk.CTk):
         self.refresh_sidebar()
         self.load_latest_or_empty()
         
-        self.search_bar.focus_set()
         self.bind("<Control-f>", self.focus_search)
         self.bind("<Control-s>", self.manual_save)
 
@@ -65,6 +66,20 @@ class HistoryNotes(ctk.CTk):
             conn.execute('CREATE TABLE IF NOT EXISTS note_list (id INTEGER PRIMARY KEY, title TEXT, pinned INTEGER DEFAULT 0, is_deleted INTEGER DEFAULT 0, last_content TEXT, last_updated TEXT)')
             conn.execute('CREATE TABLE IF NOT EXISTS history (note_id INTEGER, content TEXT, timestamp TEXT)')
             conn.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
+            
+            # Prüfen ob DB leer ist für Willkommensnotiz
+            cursor = conn.execute("SELECT COUNT(*) FROM note_list")
+            if cursor.fetchone()[0] == 0:
+                # Sprache vorab checken (Standard DE)
+                lang_res = conn.execute("SELECT value FROM settings WHERE key = 'lang'").fetchone()
+                l = lang_res[0] if lang_res else "DE"
+                
+                welcome_t = "Willkommen!" if l == "DE" else "Welcome!"
+                welcome_c = "Dies ist deine erste Notiz." if l == "DE" else "This is your first note."
+                now = datetime.now().isoformat()
+                
+                conn.execute("INSERT INTO note_list (title, last_content, last_updated) VALUES (?, ?, ?)", 
+                             (welcome_t, welcome_c, now))
             conn.commit()
 
     def _init_ui(self):
@@ -105,7 +120,7 @@ class HistoryNotes(ctk.CTk):
         self.editor_container = ctk.CTkFrame(self.main_content, fg_color="transparent")
         self.editor_container.grid(row=0, column=0, sticky="nsew", padx=20, pady=10)
         self.editor_container.grid_columnconfigure(0, weight=1)
-        self.editor_container.grid_rowconfigure(1, weight=1)
+        self.editor_container.grid_rowconfigure(2, weight=1) 
         
         self.top_bar = ctk.CTkFrame(self.editor_container, fg_color="transparent")
         self.top_bar.grid(row=0, column=0, sticky="ew", pady=(0,5))
@@ -114,11 +129,16 @@ class HistoryNotes(ctk.CTk):
         self.del_btn.pack(side="right")
         self.restore_btn = ctk.CTkButton(self.top_bar, text=self.get_str("restore"), fg_color="#228844", width=140, command=self.restore_note)
 
+        self.title_entry = ctk.CTkEntry(self.editor_container, font=("Segoe UI", 22, "bold"), fg_color="transparent", border_width=0)
+        self.title_entry.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        self.title_entry.bind("<KeyRelease>", self.on_key_release)
+        self.title_entry.bind("<Tab>", self._focus_editor)
+
         self.editor = ctk.CTkTextbox(self.editor_container, font=("Consolas", 16), undo=True, fg_color="#121212")
-        self.editor.grid(row=1, column=0, sticky="nsew")
+        self.editor.grid(row=2, column=0, sticky="nsew")
         
         self.status_bar = ctk.CTkLabel(self.editor_container, text="", font=("Segoe UI", 11), text_color="gray")
-        self.status_bar.grid(row=2, column=0, sticky="w", pady=2)
+        self.status_bar.grid(row=3, column=0, sticky="w", pady=2)
 
         self.history_panel = ctk.CTkFrame(self.main_content, height=80)
         self.history_panel.grid(row=1, column=0, sticky="ew", padx=20, pady=10)
@@ -135,8 +155,6 @@ class HistoryNotes(ctk.CTk):
         self.version_info = ctk.CTkLabel(self.slider_frame, text=self.get_str("live"), width=120)
         self.version_info.pack(side="right", padx=10)
 
-        # Formatting Tags
-        self.editor.tag_config("title_line", foreground="#569CD6", spacing1=5, spacing3=10)
         self.editor.tag_config("h1", foreground="#569CD6", underline=True)
         self.editor.tag_config("bold", foreground="#CE9178")
         self.editor.tag_config("list", foreground="#B5CEA8")
@@ -151,6 +169,10 @@ class HistoryNotes(ctk.CTk):
         self.editor.bind("<KeyRelease>", self.on_key_release)
         self.editor.bind("<Control-t>", self.insert_timestamp)
         self.editor._textbox.bind("<MouseWheel>", lambda e: self.apply_markdown())
+
+    def _focus_editor(self, event=None):
+        self.editor.focus_set()
+        return "break"
 
     def _on_search_key(self, event):
         self.refresh_sidebar()
@@ -176,8 +198,8 @@ class HistoryNotes(ctk.CTk):
         popup.attributes("-topmost", True)
         
         lbl = ctk.CTkLabel(popup, text=self.get_str("saved"), 
-                           text_color="#4DA6FF",
-                           font=("Segoe UI", 13, "bold"))
+                            text_color="#4DA6FF",
+                            font=("Segoe UI", 13, "bold"))
         lbl.pack(padx=10, pady=5)
 
         self.update_idletasks()
@@ -216,17 +238,18 @@ class HistoryNotes(ctk.CTk):
         self.is_loading = False
 
     def _update_editor_silently(self, content):
-        self.editor.delete("1.0", "end")
-        self.editor.insert("1.0", content)
+        self.editor.delete("0.0", "end")
+        self.editor.insert("0.0", content)
         self.apply_markdown(full_scan=True)
         self.last_saved_content_len = len(content)
 
     def auto_save(self):
         if not self.current_note_id or self.is_loading: return
-        content = self.editor.get("1.0", "end-1c")
+        content = self.editor.get("0.0", "end-1c")
         current_len = len(content)
-        first_line = content.split('\n')[0].strip()
-        new_title = (re.sub(r'^#+\s*', '', first_line) or "...")[:40]
+        new_title = self.title_entry.get().strip()
+        if not new_title: new_title = self.get_str("new_note_default")
+        new_title = new_title[:40]
         
         if (new_title == self.current_title_cache) and abs(current_len - self.last_saved_content_len) < 5: return 
 
@@ -238,9 +261,11 @@ class HistoryNotes(ctk.CTk):
             conn.execute("UPDATE note_list SET title = ?, last_content = ?, last_updated = ? WHERE id = ?", (new_title, content, now_str, self.current_note_id))
             conn.commit()
             
-        self.current_title_cache = new_title
+        if new_title != self.current_title_cache:
+            self.current_title_cache = new_title
+            self.refresh_sidebar()
+            
         self.last_saved_content_len = current_len
-        if new_title != self.current_title_cache: self.refresh_sidebar()
         self._update_history_data()
 
     def _update_history_data(self):
@@ -255,8 +280,10 @@ class HistoryNotes(ctk.CTk):
 
     def force_save(self):
         if not self.current_note_id or self.is_loading: return
-        content = self.editor.get("1.0", "end-1c")
-        new_title = (re.sub(r'^#+\s*', '', (content.split('\n')[0].strip())) or "...")[:40]
+        content = self.editor.get("0.0", "end-1c")
+        new_title = self.title_entry.get().strip()
+        if not new_title: new_title = self.get_str("new_note_default")
+        new_title = new_title[:40]
         now_str = datetime.now().isoformat()
         with self._get_conn() as conn:
             conn.execute("UPDATE note_list SET title = ?, last_content = ?, last_updated = ? WHERE id = ?", (new_title, content, now_str, self.current_note_id))
@@ -270,11 +297,12 @@ class HistoryNotes(ctk.CTk):
             res = conn.execute("SELECT title, last_content FROM note_list WHERE id = ?", (nid,)).fetchone()
             if res:
                 self.current_title_cache = res[0]
-                self.editor.delete("1.0", "end")
-                self.editor.insert("1.0", res[1])
+                self.title_entry.delete(0, "end")
+                if res[0] and res[0] != self.get_str("new_note_default"):
+                    self.title_entry.insert(0, res[0])
+                self.editor.delete("0.0", "end")
+                self.editor.insert("0.0", res[1])
                 self.editor._textbox.see("1.0")
-                self.editor._textbox.mark_set("insert", "1.0")
-                self.editor.focus_set()
                 self.apply_markdown(full_scan=True)
                 self.update_stats()
                 self.update_delete_button_state()
@@ -292,7 +320,8 @@ class HistoryNotes(ctk.CTk):
                     conn.execute("DELETE FROM history WHERE note_id = ?", (self.current_note_id,))
                     conn.commit()
                     self.current_note_id = None
-                    self.editor.delete("1.0", "end")
+                    self.title_entry.delete(0, "end")
+                    self.editor.delete("0.0", "end")
             else:
                 conn.execute("UPDATE note_list SET is_deleted = 1, pinned = 0 WHERE id = ?", (self.current_note_id,))
                 conn.commit()
@@ -360,10 +389,9 @@ class HistoryNotes(ctk.CTk):
                 if self.editor._textbox.compare(start_idx, "<", "1.0"): start_idx = "1.0"
                 end_idx = self.editor._textbox.index(f"{end_idx} lineend +5 lines")
             
-            for tag in ["h1", "bold", "list", "timestamp", "title_line", "url", "search_match"]: 
+            for tag in ["h1", "bold", "list", "timestamp", "url", "search_match"]: 
                 self.editor.tag_remove(tag, start_idx, end_idx)
             
-            self.editor.tag_add("title_line", "1.0", "1.end")
             content = self.editor.get(start_idx, end_idx)
             
             for m in re.finditer(r"^# .*", content, re.M): 
@@ -395,10 +423,15 @@ class HistoryNotes(ctk.CTk):
 
     def create_new_note(self):
         now_str = datetime.now().isoformat()
+        default_title = self.get_str("new_note_default")
         with self._get_conn() as conn:
-            c = conn.cursor(); c.execute("INSERT INTO note_list (title, last_content, last_updated) VALUES ('...', '', ?)", (now_str,))
+            c = conn.cursor(); c.execute("INSERT INTO note_list (title, last_content, last_updated) VALUES (?, '', ?)", (default_title, now_str,))
             nid = c.lastrowid; conn.commit()
-        self.refresh_sidebar(); self.load_note(nid)
+        
+        self.search_bar.delete(0, "end") 
+        self.refresh_sidebar()
+        self.load_note(nid)
+        self.title_entry.focus_set() 
 
     def toggle_pin(self, nid):
         with self._get_conn() as conn:
@@ -455,7 +488,7 @@ class HistoryNotes(ctk.CTk):
         except: return d
 
     def update_stats(self):
-        text = self.editor.get("1.0", "end-1c")
+        text = self.editor.get("0.0", "end-1c")
         self.status_bar.configure(text=self.get_str("stats").format(len(text.split()), len(text)))
 
     def load_latest_or_empty(self):
