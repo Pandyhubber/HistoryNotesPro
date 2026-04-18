@@ -1,0 +1,24 @@
+📝 HistoryNotes PRO – Kurzanleitung
+1. Notizen verwalten
+Neu: Klick auf + Neue Notiz. Die erste Zeile (mit # für Titel) wird automatisch als Name in der Seitenleiste übernommen.
+
+Suche: Tippe im Suchfeld, um Titel oder Inhalte sofort zu filtern.
+
+Archiv: Mit dem 📦-Icon wechselst du zwischen aktiven und archivierten Notizen.
+
+2. Editor & Features
+Markdown: Nutze # für Überschriften, ** für Fettgedrucktes und - für Listen.
+
+Zeitstempel: Drücke Strg + T, um Datum und Uhrzeit einzufügen.
+
+Speichern: Die App speichert automatisch alle 2 Sekunden oder sofort beim Wechseln der Notiz (Zero Data Loss).
+
+3. Versionsverlauf (History)
+Slider: Bewege den Schieberegler unten, um ältere Stände der Notiz anzusehen.
+
+Wiederherstellen: Um eine alte Version zu fixieren, klicke auf der Timeline einfach auf den gewünschten Punkt und tippe weiter – oder nutze Live, um zum aktuellen Stand zurückzukehren.
+
+4. Datensicherheit
+Export/Import: Über das Menü Datei kannst du alle Notizen als .zip sichern oder Texte importieren.
+
+Datenbank: Deine Daten liegen lokal in der Datei notes_vault.db.
