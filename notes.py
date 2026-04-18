@@ -4,6 +4,7 @@ import sqlite3
 import zipfile
 import re
 import webbrowser
+import sys
 from pathlib import Path
 from datetime import datetime
 from tkinter import messagebox, filedialog
@@ -48,7 +49,6 @@ class NoteVault:
             
             cursor = self.conn.execute("SELECT COUNT(*) FROM note_list")
             if cursor.fetchone()[0] == 0:
-                # Default to EN on fresh start
                 lang = self.get_setting("lang", "EN")
                 self.create_note(STR_TABLE[lang]["welcome_title"], STR_TABLE[lang]["welcome_text"])
 
@@ -147,10 +147,16 @@ class HistoryNotesApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         
-        db_path = Path(__file__).resolve().parent / 'notes_vault.db'
+        # --- PATH RESOLUTION FOR EXE AND SCRIPT ---
+        if getattr(sys, 'frozen', False):
+            base_path = Path(sys.executable).parent
+        else:
+            base_path = Path(__file__).resolve().parent
+        
+        db_path = base_path / 'notes_vault.db'
         self.vault = NoteVault(db_path)
         
-        # Default application language set to EN
+        # Default application language
         self.lang = self.vault.get_setting("lang", "EN")
         self.current_note_id = None
         self.show_archived = False
@@ -460,7 +466,7 @@ class HistoryNotesApp(ctk.CTk):
             
             rules = [
                 ("h1", r"^# .*", re.M), ("bold", r"\*\*.*?\*\*", 0), ("list", r"^[ \t]*[-*+] .*", re.M),
-                ("timestamp", r"--- \d{2}\.\d{2}\.\d{4}, \d{2}:\d{2} ---", 0),
+                ("timestamp", r"--- \d{2}\.\d. {2}\.\d{4}, \d{2}:\d{2} ---", 0),
                 ("url", r"\b(?:https?://)?(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?\b", 0)
             ]
             for tag, pattern, flag in rules:
