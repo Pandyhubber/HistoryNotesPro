@@ -1,61 +1,67 @@
 📝 History Notes Pro
+Minimal. Fast. Focused note-taking for history lovers.
+<p align="center"> <img src="https://img.shields.io/badge/Platform-Windows-blue?style=for-the-badge"> <img src="https://img.shields.io/badge/Python-3.x-yellow?style=for-the-badge"> <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge"> <img src="https://img.shields.io/badge/Status-Stable-success?style=for-the-badge"> </p>
+✨ Overview
 
-A lightweight, distraction-free tool for capturing and organizing your history notes.
+History Notes Pro is a lightweight desktop tool designed for fast, distraction-free note-taking.
+Built for simplicity and efficiency, it helps you focus on what matters: your ideas.
 
-🚀 Turn It Into a Desktop App (.exe)
+🚀 Get the Desktop App (.exe)
 
-Follow this simple guide to convert the project into a standalone Windows application:
+Turn the project into a standalone Windows app in minutes:
 
-🧩 Step 1 — Install Python
+🧩 1. Install Python
 
-Download Python from python.org
+Download from 👉 https://www.python.org/
 
-⚠️ Important: أثناء التثبيت، تأكد من تفعيل خيار
-“Add Python to PATH”
+⚠️ Important: أثناء التثبيت، فعّل
+"Add Python to PATH"
 
-📦 Step 2 — Download the Project
-Click the green Code button on this page
-Select Download ZIP
-Extract the ZIP file somewhere easy (like your Desktop)
-💻 Step 3 — Open Command Prompt in the Folder
-Open the folder containing notes.py
-Click the address bar at the top
-Type cmd and press Enter
-⚙️ Step 4 — Install PyInstaller
-
-Run this command:
-
+📦 2. Download the Source Code
+Click Code → Download ZIP
+Extract it anywhere (Desktop recommended)
+💻 3. Open Command Prompt
+Open the project folder
+Click the address bar
+Type cmd → press Enter
+⚙️ 4. Install Build Tool
 pip install pyinstaller
-🏗 Step 5 — Build the App
-
-Convert the script into an .exe:
-
+🏗 5. Build the Executable
 pyinstaller --onefile --windowed notes.py
-📂 Step 6 — Find Your App
-Open the newly created dist folder
-You’ll find notes.exe inside
-Move it anywhere and run it 🎉
-✨ Features & Shortcuts
-🚀 Feature	💡 What It Does
-Auto-Save	Saves automatically after 1 second of inactivity (if changes > 5 characters)
-Manual Save	Ctrl + S — Save instantly with a subtle confirmation
-Search	Ctrl + F — Quickly find any note
-Timestamp	Ctrl + T — Insert current date & time
-Portable	Stores data in notes_vault.db (same folder as the app)
-Clean UI	Minimal, distraction-free interface
-⚠️ Important Warning
+📂 6. Run Your App
+Go to the dist folder
+Launch notes.exe 🎉
+🧠 Features
+<p align="center">
+Feature	Description
+⚡ Auto Save	Saves automatically after 1s of inactivity
+💾 Manual Save	Ctrl + S for instant save
+🔍 Search	Ctrl + F to find notes instantly
+🕒 Timestamp	Ctrl + T inserts date & time
+📦 Portable	All data stored locally
+🎯 Minimal UI	Clean interface for maximum focus
+</p>
+📁 Data Storage
+
+Your notes are محفوظة في:
+
+notes_vault.db
+
+📌 Located in the same folder as the app.
+
+⚠️ Warning
 
 [!CAUTION]
-Deleting notes_vault.db will permanently erase all your notes.
-There is no recovery.
+Deleting notes_vault.db will permanently delete all your notes.
+No backup. No recovery.
 
 💡 Pro Tip
 
-Want to move your notes to another computer?
+To transfer your notes to another computer:
 
-👉 Just copy:
+✔ Copy both files:
 
 notes.exe
 notes_vault.db
 
-Keep them in the same folder, and everything will work instantly.
+📁 Keep them in the same folder — done.
