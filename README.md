@@ -37,6 +37,7 @@ Open the newly created **dist** folder. Your **notes.exe** is ready to use or mo
 | :--- | :--- |
 | **Auto-Save** | Triggers 1s after typing stops (if >5 chars changed). |
 | **Manual Save** | **Ctrl + S** — Force-save with a discrete popup. |
+| **History Slider** | A simple slider to browse every change you've made. |
 | **Search** | **Ctrl + F** — Instantly find specific entries. |
 | **Timestamp** | **Ctrl + T** — Inserts current date and time. |
 | **Portable** | Data is stored in **notes_vault.db** within the app folder. |
