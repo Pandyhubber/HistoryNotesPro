@@ -20,7 +20,7 @@ If you are not a programmer, follow these simple steps to turn the source code i
 
 ### Step 4: Install the "Converter"
 In the Command Prompt window, type this command and press **Enter**:
-```bash
+bash
 pip install pyinstaller
 Step 5: Create the .exe
 Type this final command and press Enter:
