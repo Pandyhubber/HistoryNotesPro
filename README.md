@@ -6,7 +6,7 @@ A lightweight, efficient tool for capturing and organizing your history notes.
 
 ## 🚀 How to Use This as a Desktop App (.exe)
 
-If you are not a programmer, follow these simple steps to turn the source code into a clickable application for your Windows computer.
+Follow these simple steps to turn the source code into a clickable application for your Windows computer.
 
 ### Step 1: Install Python
 
