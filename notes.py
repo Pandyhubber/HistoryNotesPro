@@ -34,7 +34,7 @@ class HistoryNotes(ctk.CTk):
                 "lang_btn": "Sprache: DE", "menu_file": "Datei", "export": "Export (.zip)", 
                 "import": "Import (.txt/.zip)", "stats": "Wörter: {} | Zeichen: {}", 
                 "confirm_del": "Notiz wirklich endgültig löschen?", "history_label": "Versionsverlauf",
-                "menu_file_label": "Datei"
+                "menu_file_label": "Datei", "saved": "Gespeichert"
             },
             "EN": {
                 "title": "HistoryNotes PRO", "new": "+ New Note", "del": "Archive", "final_del": "Delete Permanently",
@@ -42,7 +42,7 @@ class HistoryNotes(ctk.CTk):
                 "lang_btn": "Language: EN", "menu_file": "File", "export": "Export (.zip)", 
                 "import": "Import (.txt/.zip)", "stats": "Words: {} | Chars: {}", 
                 "confirm_del": "Delete note permanently?", "history_label": "History Version",
-                "menu_file_label": "File"
+                "menu_file_label": "File", "saved": "Saved"
             }
         }
 
@@ -55,6 +55,7 @@ class HistoryNotes(ctk.CTk):
         
         self.search_bar.focus_set()
         self.bind("<Control-f>", self.focus_search)
+        self.bind("<Control-s>", self.manual_save)
 
     def _get_conn(self):
         return sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
@@ -141,8 +142,6 @@ class HistoryNotes(ctk.CTk):
         self.editor.tag_config("list", foreground="#B5CEA8")
         self.editor.tag_config("timestamp", foreground="#718096")
         self.editor.tag_config("url", foreground="#4DA6FF", underline=True)
-        
-        # High Visibility Search Highlight: Bright Yellow Background, Black Text
         self.editor.tag_config("search_match", background="#FFFF00", foreground="#000000")
 
         self.editor._textbox.tag_bind("url", "<Button-1>", self.open_url)
@@ -162,6 +161,31 @@ class HistoryNotes(ctk.CTk):
         self.search_bar.select_range(0, 'end')
         self.search_bar.icursor('end')
         return "break"
+
+    def manual_save(self, event=None):
+        if self.current_note_id:
+            self.force_save()
+            self.show_save_popup()
+            self.update_stats()
+        return "break"
+
+    def show_save_popup(self):
+        popup = tk.Toplevel(self)
+        popup.overrideredirect(True)
+        popup.attributes("-alpha", 0.5)
+        popup.attributes("-topmost", True)
+        
+        lbl = ctk.CTkLabel(popup, text=self.get_str("saved"), 
+                           text_color="#4DA6FF",
+                           font=("Segoe UI", 13, "bold"))
+        lbl.pack(padx=10, pady=5)
+
+        self.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() // 2) - (popup.winfo_width() // 2)
+        y = self.winfo_y() + 60
+        
+        popup.geometry(f"+{x}+{y}")
+        self.after(2000, popup.destroy)
 
     def open_url(self, event):
         try:
@@ -348,12 +372,11 @@ class HistoryNotes(ctk.CTk):
                 self.editor.tag_add("bold", f"{start_idx} + {m.start()} chars", f"{start_idx} + {m.end()} chars")
             for m in re.finditer(r"^[ \t]*[-*+] .*", content, re.M): 
                 self.editor.tag_add("list", f"{start_idx} + {m.start()} chars", f"{start_idx} + {m.end()} chars")
-            for m in re.finditer(r"--- \d{2}\.\d.2}\.\d{4}, \d{2}:\d{2} ---", content): 
+            for m in re.finditer(r"--- \d{2}\.\d{2}\.\d{4}, \d{2}:\d{2} ---", content): 
                 self.editor.tag_add("timestamp", f"{start_idx} + {m.start()} chars", f"{start_idx} + {m.end()} chars")
             for m in re.finditer(r"\b(?:https?://)?(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?\b", content): 
                 self.editor.tag_add("url", f"{start_idx} + {m.start()} chars", f"{start_idx} + {m.end()} chars")
             
-            # Live Search Highlighting
             search_query = self.search_bar.get()
             if search_query:
                 for m in re.finditer(re.escape(search_query), content, re.I):
