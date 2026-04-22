@@ -466,9 +466,9 @@ class HistoryNotesApp(ctk.CTk):
             
             rules = [
                 ("h1", r"^# .*", re.M), ("bold", r"\*\*.*?\*\*", 0), ("list", r"^[ \t]*[-*+] .*", re.M),
-                ("timestamp", r"--- \d{2}\.\d. {2}\.\d{4}, \d{2}:\d{2} ---", 0),
+                ("timestamp", r"--- \d{2}\.\d{2}\.\d{4}, \d{2}:\d{2} ---", 0),
                 ("url", r"\b(?:https?://)?(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?\b", 0)
-            ]
+    ]
             for tag, pattern, flag in rules:
                 for m in re.finditer(pattern, content, flag):
                     self.editor.tag_add(tag, f"{start_idx} + {m.start()} chars", f"{start_idx} + {m.end()} chars")
