@@ -25,6 +25,7 @@ Run the following command:
 
 ```bash
 pip install pyinstaller
+python -m PyInstaller --noconsole --onefile --icon=app_icon.ico --add-data "app_icon.ico;." notes.py
 ```
 ## 5. Locate Your App
 Open the newly created **dist** folder. Your **notes.exe** is ready to use or move to your Desktop.
