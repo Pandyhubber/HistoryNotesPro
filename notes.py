@@ -5,9 +5,19 @@ import zipfile
 import re
 import webbrowser
 import sys
+import ctypes
 from pathlib import Path
 from datetime import datetime
 from tkinter import messagebox, filedialog
+
+# ==========================================
+# TASKBAR ICON FIX (AppUserModelID)
+# ==========================================
+try:
+    myappid = 'historynotespro' 
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+except Exception:
+    pass
 
 # ==========================================
 # 1. LOCALIZATION & CONFIG
@@ -147,7 +157,6 @@ class HistoryNotesApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         
-        # --- PATH RESOLUTION FOR EXE AND SCRIPT ---
         if getattr(sys, 'frozen', False):
             base_path = Path(sys.executable).parent
         else:
@@ -156,7 +165,11 @@ class HistoryNotesApp(ctk.CTk):
         db_path = base_path / 'notes_vault.db'
         self.vault = NoteVault(db_path)
         
-        # Default application language
+        # Set Window/Taskbar Icon
+        icon_path = base_path / 'app_icon.ico'
+        if icon_path.exists():
+            self.iconbitmap(str(icon_path))
+        
         self.lang = self.vault.get_setting("lang", "EN")
         self.current_note_id = None
         self.show_archived = False
@@ -255,7 +268,7 @@ class HistoryNotesApp(ctk.CTk):
         self.editor.tag_config("h1", foreground="#569CD6", underline=True)
         self.editor.tag_config("bold", foreground="#CE9178")
         self.editor.tag_config("list", foreground="#B5CEA8")
-        self.editor.tag_config("timestamp", foreground="#718096")
+        self.editor.tag_config("timestamp", foreground="#A0A0A0") # Anthracite Color
         self.editor.tag_config("url", foreground="#4DA6FF", underline=True)
         self.editor.tag_config("search_match", background="#FFFF00", foreground="#000000")
         self.editor._textbox.tag_bind("url", "<Button-1>", self.open_url)
@@ -373,6 +386,7 @@ class HistoryNotesApp(ctk.CTk):
         content = self.editor.get("0.0", "end-1c")
         title = (self.title_entry.get().strip() or self.get_str("new_note_default"))[:40]
         self.vault.save_snapshot(self.current_note_id, title, content, force_history=False)
+        self.refresh_sidebar()
 
     def load_note(self, nid):
         if self.current_note_id is not None: self.force_save()
@@ -466,9 +480,10 @@ class HistoryNotesApp(ctk.CTk):
             
             rules = [
                 ("h1", r"^# .*", re.M), ("bold", r"\*\*.*?\*\*", 0), ("list", r"^[ \t]*[-*+] .*", re.M),
+                # Corrected Regex: Matches DD.MM.YYYY, HH:MM exactly
                 ("timestamp", r"--- \d{2}\.\d{2}\.\d{4}, \d{2}:\d{2} ---", 0),
                 ("url", r"\b(?:https?://)?(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?\b", 0)
-    ]
+            ]
             for tag, pattern, flag in rules:
                 for m in re.finditer(pattern, content, flag):
                     self.editor.tag_add(tag, f"{start_idx} + {m.start()} chars", f"{start_idx} + {m.end()} chars")
