@@ -440,6 +440,9 @@ class HistoryNotesApp(ctk.CTk):
         self.menubar = tk.Menu(self)
         self.file_menu = tk.Menu(self.menubar, tearoff=0)
         self.menubar.add_cascade(menu=self.file_menu)
+        self.help_menu = tk.Menu(self.menubar, tearoff=0)
+        self.menubar.add_cascade(label="Help", menu=self.help_menu)
+        self._build_help_menu()
         self.config(menu=self.menubar)
 
         self.paned_window = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg="#1a1a1a", sashwidth=2, borderwidth=0)
@@ -903,6 +906,31 @@ class HistoryNotesApp(ctk.CTk):
     def update_stats(self):
         text = self.editor.get("0.0", "end-1c")
         self.status_bar.configure(text=self.get_str("stats").format(len(text.split()), len(text)))
+
+    def _build_help_menu(self):
+        m = self.help_menu
+        shortcuts = [
+            ("Save",             "Ctrl+S"),
+            ("Search",           "Ctrl+F"),
+            ("Insert timestamp", "Ctrl+T"),
+            ("Bold / fat text",  "Ctrl+B"),
+        ]
+        syntax = [
+            ("Heading",          "# text"),
+            ("Orange highlight", "**text**"),
+            ("Fat / bold",       "+++text+++"),
+            ("Underline",        "__text__"),
+            ("Strikethrough",    "~~text~~"),
+            ("Color",            "right-click menu"),
+            ("List item",        "- text  or  * text"),
+        ]
+        m.add_command(label="── Keyboard shortcuts ──", state="disabled")
+        for label, key in shortcuts:
+            m.add_command(label=f"{label:<22}{key}", state="disabled")
+        m.add_separator()
+        m.add_command(label="── Formatting syntax ──", state="disabled")
+        for label, syntax_str in syntax:
+            m.add_command(label=f"{label:<22}{syntax_str}", state="disabled")
 
     def load_latest_or_empty(self):
         nid = self.vault.get_latest_active_id()
