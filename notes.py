@@ -127,6 +127,15 @@ class NoteVault:
     def get_export_data(self):
         return self.conn.execute("SELECT title, last_content FROM note_list WHERE is_deleted = 0").fetchall()
 
+    def get_note_by_title(self, title: str):
+        row = self.conn.execute("SELECT id, last_content FROM note_list WHERE title = ? AND is_deleted = 0 LIMIT 1", (title,)).fetchone()
+        return row  # (id, content) or None
+
+    def update_note_content(self, nid: int, content: str):
+        now_str = datetime.now().isoformat()
+        with self.conn:
+            self.conn.execute("UPDATE note_list SET last_content = ?, last_updated = ? WHERE id = ?", (content, now_str, nid))
+
 # ==========================================
 # 3. UI COMPONENTS
 # ==========================================
@@ -151,7 +160,230 @@ class NoteButton(ctk.CTkFrame):
         self.pin_mini.configure(text=self.get_str("pin") if not pinned else self.get_str("unpin"))
 
 # ==========================================
-# 4. MAIN APPLICATION
+# 4. TIMETRACKING ENGINE
+# ==========================================
+class TimetrackingEngine:
+    """
+    Parses a Timetracking note and a Clients mapping note.
+    Produces a structured summary: per-client ticket lines, totals, warnings.
+
+    Entry formats supported (one per line):
+        1.5h PREFIX-123 description
+        0.5h PREFIX 123 description
+        0.5h PREFIX-123            (no description)
+
+    Date marker format (inserted by Ctrl+T in Timetracking note):
+        --- DD.MM.YYYY ---
+
+    Client mapping format (one per line in Timetracking Clients note):
+        PREFIX = Client Name
+    """
+
+    # Matches a time value at the start: 1h, 1.5h, 0.5h etc.
+    _TIME_RE = re.compile(r'^(\d+(?:\.\d+)?)h\s+', re.IGNORECASE)
+    # Looks like a time entry but may be malformed
+    _LOOKS_LIKE_ENTRY_RE = re.compile(r'^\d', re.IGNORECASE)
+    # Date marker: --- DD.MM.YYYY ---
+    _DATE_RE = re.compile(r'^---\s*(\d{2})\.(\d{2})\.(\d{4})\s*---$')
+    # Client mapping line: PREFIX = Name
+    _CLIENT_RE = re.compile(r'^\s*([A-Z0-9]+)\s*=\s*(.+)$', re.IGNORECASE)
+
+    def parse_clients(self, clients_content: str) -> dict:
+        """Returns {PREFIX_UPPER: display_name}"""
+        mapping = {}
+        for line in clients_content.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            m = self._CLIENT_RE.match(line)
+            if m:
+                mapping[m.group(1).upper()] = m.group(2).strip()
+        return mapping
+
+    def parse_entries(self, tt_content: str, client_map: dict):
+        """
+        Returns:
+            entries  : list of dicts {date, prefix, ticket, hours, description}
+            warnings : list of strings (human-readable)
+        """
+        entries = []
+        warnings = []
+        current_date = None
+
+        for lineno, raw in enumerate(tt_content.splitlines(), start=1):
+            line = raw.strip()
+            if not line:
+                continue
+
+            # Check for date marker
+            dm = self._DATE_RE.match(line)
+            if dm:
+                day, month, year = dm.group(1), dm.group(2), dm.group(3)
+                try:
+                    current_date = datetime(int(year), int(month), int(day)).date()
+                except ValueError:
+                    warnings.append(f"Line {lineno}: invalid date marker  \"{raw.rstrip()}\"")
+                continue
+
+            # Does it look like a time entry?
+            if not self._LOOKS_LIKE_ENTRY_RE.match(line):
+                continue  # plain text / description line, ignore silently
+
+            # Try to parse as a proper time entry
+            tm = self._TIME_RE.match(line)
+            if not tm:
+                warnings.append(f"Line {lineno}: unparseable  \"{raw.rstrip()}\"")
+                continue
+
+            hours = float(tm.group(1))
+            rest = line[tm.end():].strip()
+            if not rest:
+                warnings.append(f"Line {lineno}: unparseable (no ticket)  \"{raw.rstrip()}\"")
+                continue
+
+            # Parse prefix + ticket from rest
+            parts = rest.split()
+            first = parts[0]
+            if '-' in first:
+                # Format: PREFIX-123 description
+                split = first.split('-', 1)
+                prefix = split[0].upper()
+                ticket = first  # keep full "PREFIX-123" as ticket id
+                description = ' '.join(parts[1:])
+            else:
+                # Format: PREFIX 123 description  or  PREFIX description
+                prefix = first.upper()
+                if len(parts) > 1:
+                    ticket = f"{prefix}-{parts[1]}" if parts[1].isdigit() else parts[1]
+                    description = ' '.join(parts[2:])
+                else:
+                    ticket = prefix
+                    description = ''
+
+            if current_date is None:
+                warnings.append(f"Line {lineno}: undated entry  \"{raw.rstrip()}\"")
+                # Still record it under a sentinel date so it shows in warnings only
+                continue
+
+            entries.append({
+                'date': current_date,
+                'prefix': prefix,
+                'ticket': ticket,
+                'hours': hours,
+                'description': description,
+            })
+
+        return entries, warnings
+
+    def aggregate(self, entries: list, client_map: dict, filter_fn=None):
+        """
+        filter_fn: callable(entry) -> bool, or None for all entries.
+        Returns dict keyed by prefix:
+            { prefix: { 'name': str, 'tickets': { ticket: {'hours': float, 'descriptions': [str]} } } }
+        """
+        result = {}
+        for e in entries:
+            if filter_fn and not filter_fn(e):
+                continue
+            prefix = e['prefix']
+            if prefix not in result:
+                result[prefix] = {
+                    'name': client_map.get(prefix, f"Unknown ({prefix})"),
+                    'tickets': {}
+                }
+            tickets = result[prefix]['tickets']
+            t = e['ticket']
+            if t not in tickets:
+                tickets[t] = {'hours': 0.0, 'descriptions': []}
+            tickets[t]['hours'] += e['hours']
+            if e['description']:
+                tickets[t]['descriptions'].append(e['description'])
+        return result
+
+    def build_summary_text(self, tt_content: str, clients_content: str,
+                           view_mode: str, nav_offset: int, monthly_target: float) -> str:
+        """
+        view_mode: 'weekly' or 'monthly'
+        nav_offset: 0 = current period, -1 = one period back, etc.
+        monthly_target: hours, 0 means no target set
+        """
+        from datetime import date, timedelta
+        import calendar
+
+        client_map = self.parse_clients(clients_content)
+        entries, warnings = self.parse_entries(tt_content, client_map)
+
+        today = date.today()
+
+        if view_mode == 'weekly':
+            # Mon of the current week + offset
+            monday = today - timedelta(days=today.weekday()) + timedelta(weeks=nav_offset)
+            friday = monday + timedelta(days=4)
+            label = f"Week {monday.strftime('%d.%m')} – {friday.strftime('%d.%m.%Y')}"
+            filter_fn = lambda e: monday <= e['date'] <= friday
+        else:
+            # Monthly
+            target_month = today.replace(day=1)
+            # apply offset in months
+            m = today.month + nav_offset
+            y = today.year
+            while m <= 0:
+                m += 12; y -= 1
+            while m > 12:
+                m -= 12; y += 1
+            target_month = date(y, m, 1)
+            last_day = calendar.monthrange(y, m)[1]
+            period_end = date(y, m, last_day)
+            label = target_month.strftime('%B %Y')
+            filter_fn = lambda e, s=target_month, en=period_end: s <= e['date'] <= en
+
+        aggregated = self.aggregate(entries, client_map, filter_fn)
+
+        lines = []
+        lines.append(f"TIMETRACKING SUMMARY  —  {label}")
+        lines.append("")
+
+        total_hours = 0.0
+
+        for prefix, data in sorted(aggregated.items()):
+            client_total = sum(t['hours'] for t in data['tickets'].values())
+            total_hours += client_total
+            lines.append(f"── {data['name']} ({prefix}) " + "─" * max(2, 44 - len(data['name']) - len(prefix)))
+            for ticket, tdata in sorted(data['tickets'].items()):
+                desc_str = ' / '.join(dict.fromkeys(tdata['descriptions']))  # deduplicate, preserve order
+                desc_str = (desc_str[:50] + '…') if len(desc_str) > 50 else desc_str
+                lines.append(f"  {ticket:<18} {tdata['hours']:>5.1f}h   {desc_str}")
+            lines.append(f"  {'Client total:':<18} {client_total:>5.1f}h")
+            if monthly_target > 0 and view_mode == 'monthly':
+                pct = (client_total / monthly_target) * 100
+                lines.append(f"  {'% of target:':<18} {pct:>5.1f}%")
+            lines.append("")
+
+        lines.append("═" * 48)
+        lines.append(f"  {'TOTAL LOGGED:':<18} {total_hours:>5.1f}h")
+        if monthly_target > 0:
+            if view_mode == 'monthly':
+                remaining = max(0.0, monthly_target - total_hours)
+                pct = (total_hours / monthly_target) * 100
+                lines.append(f"  {'TARGET:':<18} {monthly_target:>5.1f}h")
+                lines.append(f"  {'REMAINING:':<18} {remaining:>5.1f}h")
+                lines.append(f"  {'PROGRESS:':<18} {pct:>5.1f}%")
+            else:
+                lines.append(f"  {'MONTHLY TARGET:':<18} {monthly_target:>5.1f}h  (full month)")
+        else:
+            lines.append(f"  TARGET:             not set")
+        lines.append("")
+
+        if warnings:
+            lines.append("⚠ Warnings:")
+            for w in warnings:
+                lines.append(f"  {w}")
+
+        return '\n'.join(lines)
+
+
+# ==========================================
+# 5. MAIN APPLICATION
 # ==========================================
 class HistoryNotesApp(ctk.CTk):
     def __init__(self):
@@ -184,11 +416,20 @@ class HistoryNotesApp(ctk.CTk):
         self._sidebar_order: list = []   # ordered list of currently visible note_ids
         self._sidebar_pinned_count: int = 0  # how many pinned notes are at the top of _sidebar_order
 
+        # Timetracking
+        self._tt_engine = TimetrackingEngine()
+        self._tt_view_mode = 'monthly'   # 'weekly' or 'monthly'
+        self._tt_nav_offset = 0          # 0 = current period, negative = past
+        self._tt_monthly_target = 0.0   # 0 means not set
+        self._tt_is_summary = False      # True when Summary note is open
+
         self.geometry("1100x850")
         ctk.set_appearance_mode("dark")
         
         self._init_ui()
         self.update_ui_texts()
+        self._ensure_special_notes()
+        self._tt_load_settings()
         self.refresh_sidebar()
         self.load_latest_or_empty()
         
@@ -265,21 +506,49 @@ class HistoryNotesApp(ctk.CTk):
         self.version_info = ctk.CTkLabel(self.slider_frame, width=120)
         self.version_info.pack(side="right", padx=10)
 
+        # Summary toolbar (shown only when Timetracking Summary is open)
+        self.summary_toolbar = ctk.CTkFrame(self.main_content, fg_color="#1e1e2e", height=44)
+        # not gridded by default -- shown/hidden in load_note
+        self._build_summary_toolbar()
+
         self._setup_markdown_tags()
+
+    # Colour palette: muted, dark-background-friendly
+    FORMAT_COLORS = [
+        ("Slate Blue",   "#7B9EC9"),
+        ("Sage Green",   "#7EAA7E"),
+        ("Warm Amber",   "#C9A84C"),
+        ("Dusty Rose",   "#B87A7A"),
+        ("Muted Teal",   "#5FA8A0"),
+        ("Steel Gray",   "#8A9BB0"),
+    ]
+    # Regex: matches [colorname]...[/colorname]
+    _COLOR_TAG_RE = re.compile(r'\[([a-z_]+)\](.*?)\[/\1\]', re.DOTALL)
 
     def _setup_markdown_tags(self):
         self.editor.tag_config("h1", foreground="#569CD6", underline=True)
         self.editor.tag_config("bold", foreground="#CE9178")
         self.editor.tag_config("list", foreground="#B5CEA8")
-        self.editor.tag_config("timestamp", foreground="#A0A0A0") # Anthracite Color
+        self.editor.tag_config("timestamp", foreground="#A0A0A0")
         self.editor.tag_config("url", foreground="#4DA6FF", underline=True)
         self.editor.tag_config("search_match", background="#FFFF00", foreground="#000000")
+        self.editor.tag_config("underline", underline=True)
+        self.editor.tag_config("strikethrough", overstrike=True)
+        self.editor._textbox.tag_config("bold_weight", font=("Consolas", 16, "bold"))
+        # elide tags -- used to hide syntax markers for __, ~~, +++, and [color]
+        self.editor._textbox.tag_config("color_hidden", elide=True)
+        self.editor._textbox.tag_config("fmt_hidden", elide=True)
+        for label, hex_color in self.FORMAT_COLORS:
+            tag_name = "color_" + label.lower().replace(" ", "_")
+            self.editor.tag_config(tag_name, foreground=hex_color)
         self.editor._textbox.tag_bind("url", "<Button-1>", self.open_url)
         self.editor._textbox.tag_bind("url", "<Enter>", lambda e: self.editor._textbox.configure(cursor="hand2"))
         self.editor._textbox.tag_bind("url", "<Leave>", lambda e: self.editor._textbox.configure(cursor="xterm"))
         self.editor.bind("<KeyRelease>", self.on_key_release)
         self.editor.bind("<Control-t>", self.insert_timestamp)
+        self.editor.bind("<Control-b>", lambda e: self._apply_format("+++", "+++") or "break")
         self.editor._textbox.bind("<MouseWheel>", lambda e: self.apply_markdown())
+        self.editor._textbox.bind("<Button-3>", self._show_context_menu)
 
     # ==========================================
     # LOGIC & EVENTS
@@ -386,6 +655,10 @@ class HistoryNotesApp(ctk.CTk):
         if not unpinned or unpinned[0] != self.current_note_id:
             self.refresh_sidebar()
 
+        # Recalculate summary if Timetracking or Clients note just changed
+        if new_title in (self.TITLE_TT, self.TITLE_CLIENTS):
+            self._render_summary()
+
     def force_save(self):
         if not self.current_note_id or self.is_loading: return
         content = self.editor.get("0.0", "end-1c")
@@ -402,11 +675,32 @@ class HistoryNotesApp(ctk.CTk):
             self.current_title_cache = title
             self.title_entry.delete(0, "end")
             if title and title != self.get_str("new_note_default"): self.title_entry.insert(0, title)
-            self.editor.delete("0.0", "end")
-            self.editor.insert("0.0", content)
-            self.editor._textbox.see("1.0")
-            self.apply_markdown(full_scan=True)
-            self.update_stats()
+
+            # Determine if this is the Summary note
+            self._tt_is_summary = (title == self.TITLE_SUMMARY)
+
+            if self._tt_is_summary:
+                # Show summary toolbar, hide history panel
+                self.summary_toolbar.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 4))
+                self.history_panel.grid_remove()
+                # Populate target entry
+                self._tt_target_entry.delete(0, "end")
+                if self._tt_monthly_target > 0:
+                    self._tt_target_entry.insert(0, str(int(self._tt_monthly_target) if self._tt_monthly_target == int(self._tt_monthly_target) else self._tt_monthly_target))
+                # Render fresh summary
+                self._render_summary()
+                self.editor.configure(state="disabled")
+            else:
+                # Normal note: hide summary toolbar, show history panel
+                self.summary_toolbar.grid_remove()
+                self.history_panel.grid(row=1, column=0, sticky="ew", padx=20, pady=10)
+                self.editor.configure(state="normal")
+                self.editor.delete("0.0", "end")
+                self.editor.insert("0.0", content)
+                self.editor._textbox.see("1.0")
+                self.apply_markdown(full_scan=True)
+                self.update_stats()
+
             self.update_delete_button_state(is_deleted)
             self.last_saved_content_len = len(content)
         self._update_history_data()
@@ -442,8 +736,13 @@ class HistoryNotesApp(ctk.CTk):
         self.update_delete_button_state()
 
     def insert_timestamp(self, e=None):
-        now = datetime.now().strftime("%d.%m.%Y, %H:%M")
-        self.editor.insert(tk.INSERT, f"\n--- {now} ---\n")
+        res = self.vault.get_note(self.current_note_id) if self.current_note_id else None
+        current_title = res[0] if res else ""
+        if current_title == self.TITLE_TT:
+            stamp = datetime.now().strftime("--- %d.%m.%Y ---")
+        else:
+            stamp = datetime.now().strftime("--- %d.%m.%Y, %H:%M ---")
+        self.editor.insert(tk.INSERT, f"\n{stamp}\n")
         self.apply_markdown(full_scan=True)
         self.auto_save()
         return "break"
@@ -502,20 +801,57 @@ class HistoryNotesApp(ctk.CTk):
                 start_idx = self.editor._textbox.index(f"{self.editor._textbox.index('@0,0')} linestart -5 lines")
                 if self.editor._textbox.compare(start_idx, "<", "1.0"): start_idx = "1.0"
                 end_idx = self.editor._textbox.index(f"{self.editor._textbox.index(f'@0,{self.editor.winfo_height()}')} lineend +5 lines")
-            
-            for tag in ["h1", "bold", "list", "timestamp", "url", "search_match"]: self.editor.tag_remove(tag, start_idx, end_idx)
+
+            all_tags = ["h1", "bold", "list", "timestamp", "url", "search_match",
+                        "underline", "strikethrough"] + [
+                        "color_" + l.lower().replace(" ", "_") for l, _ in self.FORMAT_COLORS]
+            for tag in all_tags:
+                self.editor.tag_remove(tag, start_idx, end_idx)
+            self.editor._textbox.tag_remove("bold_weight", start_idx, end_idx)
+            self.editor.tag_remove("color_hidden", start_idx, end_idx)
+            self.editor.tag_remove("fmt_hidden",   start_idx, end_idx)
             content = self.editor.get(start_idx, end_idx)
-            
-            rules = [
-                ("h1", r"^# .*", re.M), ("bold", r"\*\*.*?\*\*", 0), ("list", r"^[ \t]*[-*+] .*", re.M),
-                # Corrected Regex: Matches DD.MM.YYYY, HH:MM exactly
-                ("timestamp", r"--- \d{2}\.\d{2}\.\d{4}, \d{2}:\d{2} ---", 0),
-                ("url", r"\b(?:https?://)?(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?\b", 0)
+
+            # Simple full-span rules (markers are part of the style, no elide needed)
+            simple_rules = [
+                ("h1",        r"^# .*",                                          re.M),
+                ("bold",      r"\*\*.*?\*\*",                                    0),
+                ("list",      r"^[ \t]*[-*+] .*",                                re.M),
+                ("timestamp", r"--- \d{2}\.\d{2}\.\d{4}(?:, \d{2}:\d{2})? ---", 0),
+                ("url",       r"\b(?:https?://)?(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?\b", 0),
             ]
-            for tag, pattern, flag in rules:
+            for tag, pattern, flag in simple_rules:
                 for m in re.finditer(pattern, content, flag):
                     self.editor.tag_add(tag, f"{start_idx} + {m.start()} chars", f"{start_idx} + {m.end()} chars")
-            
+
+            # Inner-text rules: apply style to group(1), elide the markers
+            # Each tuple: (tag, open_marker_len, close_marker_len, compiled_regex)
+            inner_rules = [
+                ("underline",     2, 2, re.compile(r'__(.*?)__',         re.DOTALL)),
+                ("strikethrough", 2, 2, re.compile(r'~~(.*?)~~',         re.DOTALL)),
+                ("bold_weight",   3, 3, re.compile(r'\+\+\+(.*?)\+\+\+', re.DOTALL)),
+            ]
+            for tag, open_len, close_len, rx in inner_rules:
+                tb_ref = self.editor._textbox if tag == "bold_weight" else self.editor
+                for m in rx.finditer(content):
+                    inner_s = m.start(1)
+                    inner_e = m.end(1)
+                    tb_ref.tag_add(tag,          f"{start_idx} + {inner_s} chars", f"{start_idx} + {inner_e} chars")
+                    self.editor.tag_add("fmt_hidden", f"{start_idx} + {m.start()} chars", f"{start_idx} + {inner_s} chars")
+                    self.editor.tag_add("fmt_hidden", f"{start_idx} + {inner_e} chars",   f"{start_idx} + {m.end()} chars")
+
+            # Colour tags: color inner text only, hide the [tag]...[/tag] markers
+            for m in self._COLOR_TAG_RE.finditer(content):
+                key = m.group(1)
+                tag_name = "color_" + key
+                if tag_name not in all_tags:
+                    continue
+                inner_start = m.start(2)
+                inner_end   = m.end(2)
+                self.editor.tag_add(tag_name,      f"{start_idx} + {inner_start} chars", f"{start_idx} + {inner_end} chars")
+                self.editor.tag_add("color_hidden", f"{start_idx} + {m.start()} chars",  f"{start_idx} + {inner_start} chars")
+                self.editor.tag_add("color_hidden", f"{start_idx} + {inner_end} chars",  f"{start_idx} + {m.end()} chars")
+
             search_query = self.search_bar.get()
             if search_query:
                 for m in re.finditer(re.escape(search_query), content, re.I):
@@ -571,6 +907,190 @@ class HistoryNotesApp(ctk.CTk):
     def load_latest_or_empty(self):
         nid = self.vault.get_latest_active_id()
         if nid: self.load_note(nid)
+
+    # ==========================================
+    # RIGHT-CLICK CONTEXT MENU & INLINE FORMATTING
+    # ==========================================
+    def _show_context_menu(self, event):
+        menu = tk.Menu(self, tearoff=0, bg="#2b2b2b", fg="#d4d4d4",
+                       activebackground="#3a3a3a", activeforeground="#ffffff",
+                       bd=0, relief="flat")
+
+        if self._tt_is_summary:
+            # Summary note: Copy only
+            menu.add_command(label="Copy", command=lambda: self.editor._textbox.event_generate("<<Copy>>"))
+        else:
+            # Standard edit actions
+            menu.add_command(label="Cut",   command=lambda: self.editor._textbox.event_generate("<<Cut>>"))
+            menu.add_command(label="Copy",  command=lambda: self.editor._textbox.event_generate("<<Copy>>"))
+            menu.add_command(label="Paste", command=lambda: self.editor._textbox.event_generate("<<Paste>>"))
+            menu.add_separator()
+            menu.add_command(label="Bold",          command=lambda: self._apply_format("**", "**"))
+            menu.add_command(label="Underline",     command=lambda: self._apply_format("__", "__"))
+            menu.add_command(label="Strikethrough", command=lambda: self._apply_format("~~", "~~"))
+            menu.add_separator()
+            # Colour submenu
+            color_menu = tk.Menu(menu, tearoff=0, bg="#2b2b2b", fg="#d4d4d4",
+                                 activebackground="#3a3a3a", activeforeground="#ffffff",
+                                 bd=0, relief="flat")
+            for label, _ in self.FORMAT_COLORS:
+                tag_key = label.lower().replace(" ", "_")
+                color_menu.add_command(label=label, command=lambda k=tag_key: self._apply_color(k))
+            color_menu.add_separator()
+            color_menu.add_command(label="Remove color", command=self._remove_color)
+            menu.add_cascade(label="Color  ▶", menu=color_menu)
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _apply_format(self, open_tag: str, close_tag: str):
+        """Wrap or unwrap selected text with open_tag/close_tag markers."""
+        tb = self.editor._textbox
+        try:
+            sel_start = tb.index("sel.first")
+            sel_end   = tb.index("sel.last")
+        except tk.TclError:
+            return  # nothing selected
+        selected = tb.get(sel_start, sel_end)
+        if not selected:
+            return
+        # Toggle: strip if already wrapped
+        if selected.startswith(open_tag) and selected.endswith(close_tag) and len(selected) > len(open_tag) + len(close_tag):
+            new_text = selected[len(open_tag):-len(close_tag)]
+        else:
+            new_text = f"{open_tag}{selected}{close_tag}"
+        tb.delete(sel_start, sel_end)
+        tb.insert(sel_start, new_text)
+        self.apply_markdown(full_scan=True)
+        self.on_key_release(type('_', (), {'keysym': ''})())  # trigger debounced save
+
+    def _apply_color(self, tag_key: str):
+        """Wrap selected text in [tag_key]...[/tag_key]. Replaces existing color if present."""
+        tb = self.editor._textbox
+        try:
+            sel_start = tb.index("sel.first")
+            sel_end   = tb.index("sel.last")
+        except tk.TclError:
+            return
+        selected = tb.get(sel_start, sel_end)
+        if not selected:
+            return
+        # Strip any existing color wrapper first
+        m = self._COLOR_TAG_RE.fullmatch(selected)
+        inner = m.group(2) if m else selected
+        new_text = f"[{tag_key}]{inner}[/{tag_key}]"
+        tb.delete(sel_start, sel_end)
+        tb.insert(sel_start, new_text)
+        self.apply_markdown(full_scan=True)
+        self.on_key_release(type('_', (), {'keysym': ''})())
+
+    def _remove_color(self):
+        """Strip all [color]...[/color] wrappers from selection."""
+        tb = self.editor._textbox
+        try:
+            sel_start = tb.index("sel.first")
+            sel_end   = tb.index("sel.last")
+        except tk.TclError:
+            return
+        selected = tb.get(sel_start, sel_end)
+        if not selected:
+            return
+        new_text = self._COLOR_TAG_RE.sub(r'\2', selected)
+        if new_text != selected:
+            tb.delete(sel_start, sel_end)
+            tb.insert(sel_start, new_text)
+            self.apply_markdown(full_scan=True)
+            self.on_key_release(type('_', (), {'keysym': ''})())
+
+    # ==========================================
+    # TIMETRACKING
+    # ==========================================
+    TITLE_TT       = "Timetracking"
+    TITLE_CLIENTS  = "Timetracking Clients"
+    TITLE_SUMMARY  = "Timetracking Summary"
+    CLIENTS_DEFAULT = "# One line per client: PREFIX = Client Name\n# Example:\n# MMS = MöbelMartin\n# LGIT = LGIT GmbH\n"
+
+    def _ensure_special_notes(self):
+        """Create Timetracking special notes if they don't exist yet."""
+        for title, default_content in [
+            (self.TITLE_TT, ""),
+            (self.TITLE_CLIENTS, self.CLIENTS_DEFAULT),
+            (self.TITLE_SUMMARY, ""),
+        ]:
+            if not self.vault.get_note_by_title(title):
+                self.vault.create_note(title, default_content)
+
+    def _build_summary_toolbar(self):
+        """Populate the summary_toolbar frame with navigation controls."""
+        f = self.summary_toolbar
+
+        # Weekly nav
+        ctk.CTkLabel(f, text="Weekly", font=("Segoe UI", 12, "bold")).pack(side="left", padx=(10, 2))
+        ctk.CTkButton(f, text="◀", width=28, fg_color="gray30", command=lambda: self._tt_navigate('weekly', -1)).pack(side="left", padx=1)
+        ctk.CTkButton(f, text="▶", width=28, fg_color="gray30", command=lambda: self._tt_navigate('weekly', +1)).pack(side="left", padx=(1, 10))
+
+        # Monthly nav
+        ctk.CTkLabel(f, text="Monthly", font=("Segoe UI", 12, "bold")).pack(side="left", padx=(10, 2))
+        ctk.CTkButton(f, text="◀", width=28, fg_color="gray30", command=lambda: self._tt_navigate('monthly', -1)).pack(side="left", padx=1)
+        ctk.CTkButton(f, text="▶", width=28, fg_color="gray30", command=lambda: self._tt_navigate('monthly', +1)).pack(side="left", padx=(1, 10))
+
+        # Target
+        ctk.CTkLabel(f, text="Target (h):", font=("Segoe UI", 11)).pack(side="left", padx=(20, 4))
+        self._tt_target_entry = ctk.CTkEntry(f, width=60, font=("Segoe UI", 11))
+        self._tt_target_entry.pack(side="left")
+        self._tt_target_entry.bind("<Return>", self._tt_set_target)
+        self._tt_target_entry.bind("<FocusOut>", self._tt_set_target)
+
+        # Active period label
+        self._tt_period_label = ctk.CTkLabel(f, text="", font=("Segoe UI", 11), text_color="gray")
+        self._tt_period_label.pack(side="right", padx=10)
+
+    def _tt_navigate(self, mode: str, direction: int):
+        self._tt_view_mode = mode
+        self._tt_nav_offset += direction
+        self._render_summary()
+
+    def _tt_set_target(self, event=None):
+        try:
+            val = float(self._tt_target_entry.get().strip())
+            self._tt_monthly_target = val
+            self.vault.set_setting('tt_monthly_target', str(val))
+        except ValueError:
+            pass
+        self._render_summary()
+
+    def _render_summary(self):
+        """Recalculate and write the summary into the Summary note editor and DB."""
+        tt_row = self.vault.get_note_by_title(self.TITLE_TT)
+        cl_row = self.vault.get_note_by_title(self.TITLE_CLIENTS)
+        tt_content = tt_row[1] if tt_row else ""
+        cl_content = cl_row[1] if cl_row else ""
+
+        text = self._tt_engine.build_summary_text(
+            tt_content, cl_content,
+            self._tt_view_mode, self._tt_nav_offset, self._tt_monthly_target
+        )
+
+        # Update editor if Summary note is currently open (read-only bypass)
+        if self._tt_is_summary:
+            self.editor.configure(state="normal")
+            self.editor.delete("0.0", "end")
+            self.editor.insert("0.0", text)
+            self.editor.configure(state="disabled")
+
+        # Persist to DB so it's readable when closed
+        summary_row = self.vault.get_note_by_title(self.TITLE_SUMMARY)
+        if summary_row:
+            self.vault.update_note_content(summary_row[0], text)
+
+    def _tt_load_settings(self):
+        """Restore target from settings DB."""
+        try:
+            self._tt_monthly_target = float(self.vault.get_setting('tt_monthly_target', '0'))
+        except ValueError:
+            self._tt_monthly_target = 0.0
 
 if __name__ == "__main__":
     app = HistoryNotesApp()
