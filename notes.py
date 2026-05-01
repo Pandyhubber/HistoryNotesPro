@@ -180,6 +180,8 @@ class HistoryNotesApp(ctk.CTk):
         
         self._after_id_format = None
         self._after_id_save = None
+        self._sidebar_cache: dict = {}   # note_id -> NoteButton widget
+        self._sidebar_order: list = []   # ordered list of currently visible note_ids
 
         self.geometry("1100x850")
         ctk.set_appearance_mode("dark")
@@ -446,9 +448,32 @@ class HistoryNotesApp(ctk.CTk):
 
     def refresh_sidebar(self):
         rows = self.vault.fetch_sidebar_notes(self.search_bar.get().lower(), self.show_archived)
-        for child in self.note_list_frame.winfo_children(): child.destroy()
+        new_data = {nid: (title, pinned, is_del) for nid, title, pinned, is_del in rows}
+        new_order = [nid for nid, *_ in rows]
+
+        # Remove widgets no longer in results
+        removed = [nid for nid in list(self._sidebar_cache) if nid not in new_data]
+        for nid in removed:
+            self._sidebar_cache[nid].destroy()
+            del self._sidebar_cache[nid]
+
+        # Update or create widgets
         for nid, title, pinned, is_del in rows:
-            NoteButton(self.note_list_frame, nid, title, pinned, is_del, self.load_note, self.toggle_pin, self.get_str).pack(fill="x", pady=2)
+            if nid in self._sidebar_cache:
+                self._sidebar_cache[nid].update_data(title, pinned)
+            else:
+                btn = NoteButton(self.note_list_frame, nid, title, pinned, is_del,
+                                 self.load_note, self.toggle_pin, self.get_str)
+                self._sidebar_cache[nid] = btn
+
+        # Reorder if the visible sequence changed
+        if new_order != self._sidebar_order:
+            for nid in new_order:
+                self._sidebar_cache[nid].pack_forget()
+            for nid in new_order:
+                self._sidebar_cache[nid].pack(fill="x", pady=2)
+
+        self._sidebar_order = new_order
 
     def update_delete_button_state(self, is_deleted=None):
         if not self.current_note_id: 
