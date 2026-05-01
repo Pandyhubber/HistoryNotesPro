@@ -182,6 +182,7 @@ class HistoryNotesApp(ctk.CTk):
         self._after_id_save = None
         self._sidebar_cache: dict = {}   # note_id -> NoteButton widget
         self._sidebar_order: list = []   # ordered list of currently visible note_ids
+        self._sidebar_pinned_count: int = 0  # how many pinned notes are at the top of _sidebar_order
 
         self.geometry("1100x850")
         ctk.set_appearance_mode("dark")
@@ -372,23 +373,24 @@ class HistoryNotesApp(ctk.CTk):
         if not self.current_note_id or self.is_loading: return
         content = self.editor.get("0.0", "end-1c")
         new_title = (self.title_entry.get().strip() or self.get_str("new_note_default"))[:40]
-        
-        if (new_title == self.current_title_cache) and abs(len(content) - self.last_saved_content_len) < 5: return 
+
+        if (new_title == self.current_title_cache) and abs(len(content) - self.last_saved_content_len) < 5: return
 
         self.vault.save_snapshot(self.current_note_id, new_title, content, force_history=True)
-        if new_title != self.current_title_cache:
-            self.current_title_cache = new_title
-            self.refresh_sidebar()
-            
+        self.current_title_cache = new_title
         self.last_saved_content_len = len(content)
         self._update_history_data()
+
+        # Refresh sidebar if note is not already the topmost non-pinned entry
+        unpinned = self._sidebar_order[self._sidebar_pinned_count:]
+        if not unpinned or unpinned[0] != self.current_note_id:
+            self.refresh_sidebar()
 
     def force_save(self):
         if not self.current_note_id or self.is_loading: return
         content = self.editor.get("0.0", "end-1c")
         title = (self.title_entry.get().strip() or self.get_str("new_note_default"))[:40]
         self.vault.save_snapshot(self.current_note_id, title, content, force_history=False)
-        self.refresh_sidebar()
 
     def load_note(self, nid):
         if self.current_note_id is not None: self.force_save()
@@ -474,6 +476,7 @@ class HistoryNotesApp(ctk.CTk):
                 self._sidebar_cache[nid].pack(fill="x", pady=2)
 
         self._sidebar_order = new_order
+        self._sidebar_pinned_count = sum(1 for nid in new_order if new_data.get(nid, (None, 0))[1])
 
     def update_delete_button_state(self, is_deleted=None):
         if not self.current_note_id: 
