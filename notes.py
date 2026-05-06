@@ -7,8 +7,9 @@ import webbrowser
 import sys
 import ctypes
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from tkinter import messagebox, filedialog
+import calendar
 
 # ==========================================
 # TASKBAR ICON FIX (AppUserModelID)
@@ -30,7 +31,9 @@ STR_TABLE = {
         "import": "Import (.txt/.zip)", "stats": "Words: {} | Chars: {}", 
         "confirm_del": "Delete note permanently?", "history_label": "History Version",
         "menu_file_label": "File", "saved": "Saved", "new_note_default": "New Note",
-        "welcome_title": "Welcome!", "welcome_text": "This is your first note.\n\nYou can simply edit this text or click '+ New Note' above."
+        "welcome_title": "Welcome!", "welcome_text": "This is your first note.\n\nYou can simply edit this text or click '+ New Note' above.",
+        "history_btn": "📊 History", "daily": "Daily", "weekly": "Weekly", "monthly": "Monthly",
+        "no_history": "No historical data available for this period."
     },
     "DE": {
         "title": "HistoryNotes PRO", "new": "+ Neue Notiz", "del": "Archivieren", "final_del": "Endgültig Löschen",
@@ -39,7 +42,9 @@ STR_TABLE = {
         "import": "Import (.txt/.zip)", "stats": "Wörter: {} | Zeichen: {}", 
         "confirm_del": "Notiz wirklich endgültig löschen?", "history_label": "Versionsverlauf",
         "menu_file_label": "Datei", "saved": "Gespeichert", "new_note_default": "Neue Notiz",
-        "welcome_title": "Willkommen!", "welcome_text": "Dies ist deine erste Notiz.\n\nDu kannst diesen Text einfach löschen oder oben auf '+ Neue Notiz' klicken."
+        "welcome_title": "Willkommen!", "welcome_text": "Dies ist deine erste Notiz.\n\nDu kannst diesen Text einfach löschen oder oben auf '+ Neue Notiz' klicken.",
+        "history_btn": "📊 Verlauf", "daily": "Täglich", "weekly": "Wöchentlich", "monthly": "Monatlich",
+        "no_history": "Keine historischen Daten für diesen Zeitraum verfügbar."
     }
 }
 
@@ -56,6 +61,7 @@ class NoteVault:
             self.conn.execute('CREATE TABLE IF NOT EXISTS note_list (id INTEGER PRIMARY KEY, title TEXT, pinned INTEGER DEFAULT 0, is_deleted INTEGER DEFAULT 0, last_content TEXT, last_updated TEXT)')
             self.conn.execute('CREATE TABLE IF NOT EXISTS history (note_id INTEGER, content TEXT, timestamp TEXT)')
             self.conn.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
+            self.conn.execute('CREATE TABLE IF NOT EXISTS summary_history (date TEXT PRIMARY KEY, content TEXT, created_at TEXT)')
             
             cursor = self.conn.execute("SELECT COUNT(*) FROM note_list")
             if cursor.fetchone()[0] == 0:
@@ -136,6 +142,35 @@ class NoteVault:
         with self.conn:
             self.conn.execute("UPDATE note_list SET last_content = ?, last_updated = ? WHERE id = ?", (content, now_str, nid))
 
+    # === Summary History Methods ===
+    def save_summary_snapshot(self, date_key: str, content: str):
+        """Save a summary snapshot for a specific date (DD/MM/YYYY format)."""
+        now_str = datetime.now().isoformat()
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO summary_history (date, content, created_at) VALUES (?, ?, ?)",
+                (date_key, content, now_str)
+            )
+
+    def get_summary_snapshots(self, start_date: str = None, end_date: str = None):
+        """Get summary snapshots in date range (DD/MM/YYYY format strings)."""
+        if start_date and end_date:
+            q = "SELECT date, content FROM summary_history WHERE date >= ? AND date <= ? ORDER BY date ASC"
+            return self.conn.execute(q, (start_date, end_date)).fetchall()
+        else:
+            return self.conn.execute("SELECT date, content FROM summary_history ORDER BY date ASC").fetchall()
+
+    def get_latest_summary_snapshot(self):
+        """Get the most recent summary snapshot."""
+        row = self.conn.execute("SELECT date, content FROM summary_history ORDER BY date DESC LIMIT 1").fetchone()
+        return row
+
+    def has_summary_for_date(self, date_key: str) -> bool:
+        """Check if summary exists for a specific date."""
+        row = self.conn.execute("SELECT 1 FROM summary_history WHERE date = ?", (date_key,)).fetchone()
+        return row is not None
+
+
 # ==========================================
 # 3. UI COMPONENTS
 # ==========================================
@@ -158,6 +193,7 @@ class NoteButton(ctk.CTkFrame):
         display = (title if title and title.strip() else "...").replace("\n", " ")
         self.btn.configure(text=f"{'📌 ' if pinned else ''}{display}")
         self.pin_mini.configure(text=self.get_str("pin") if not pinned else self.get_str("unpin"))
+
 
 # ==========================================
 # 4. TIMETRACKING ENGINE
@@ -220,7 +256,7 @@ class TimetrackingEngine:
             if dm:
                 day, month, year = dm.group(1), dm.group(2), dm.group(3)
                 try:
-                    current_date = datetime(int(year), int(month), int(day)).date()
+                    current_date = date(int(year), int(month), int(day))
                 except ValueError:
                     warnings.append(f"Line {lineno}: invalid date marker  \"{raw.rstrip()}\"")
                 continue
@@ -301,21 +337,21 @@ class TimetrackingEngine:
         return result
 
     def build_summary_text(self, tt_content: str, clients_content: str,
-                           view_mode: str, nav_offset: int, monthly_target: float) -> str:
+                           view_mode: str, nav_offset: int) -> str:
         """
-        view_mode: 'weekly' or 'monthly'
+        view_mode: 'daily', 'weekly' or 'monthly'
         nav_offset: 0 = current period, -1 = one period back, etc.
-        monthly_target: hours, 0 means no target set
         """
-        from datetime import date, timedelta
-        import calendar
-
         client_map = self.parse_clients(clients_content)
         entries, warnings = self.parse_entries(tt_content, client_map)
 
         today = date.today()
 
-        if view_mode == 'weekly':
+        if view_mode == 'daily':
+            target_date = today + timedelta(days=nav_offset)
+            label = target_date.strftime('%d.%m.%Y')
+            filter_fn = lambda e: e['date'] == target_date
+        elif view_mode == 'weekly':
             # Mon of the current week + offset
             monday = today - timedelta(days=today.weekday()) + timedelta(weeks=nav_offset)
             friday = monday + timedelta(days=4)
@@ -354,24 +390,10 @@ class TimetrackingEngine:
                 desc_str = (desc_str[:50] + '…') if len(desc_str) > 50 else desc_str
                 lines.append(f"  {ticket:<18} {tdata['hours']:>5.1f}h   {desc_str}")
             lines.append(f"  {'Client total:':<18} {client_total:>5.1f}h")
-            if monthly_target > 0 and view_mode == 'monthly':
-                pct = (client_total / monthly_target) * 100
-                lines.append(f"  {'% of target:':<18} {pct:>5.1f}%")
             lines.append("")
 
         lines.append("═" * 48)
         lines.append(f"  {'TOTAL LOGGED:':<18} {total_hours:>5.1f}h")
-        if monthly_target > 0:
-            if view_mode == 'monthly':
-                remaining = max(0.0, monthly_target - total_hours)
-                pct = (total_hours / monthly_target) * 100
-                lines.append(f"  {'TARGET:':<18} {monthly_target:>5.1f}h")
-                lines.append(f"  {'REMAINING:':<18} {remaining:>5.1f}h")
-                lines.append(f"  {'PROGRESS:':<18} {pct:>5.1f}%")
-            else:
-                lines.append(f"  {'MONTHLY TARGET:':<18} {monthly_target:>5.1f}h  (full month)")
-        else:
-            lines.append(f"  TARGET:             not set")
         lines.append("")
 
         if warnings:
@@ -418,10 +440,9 @@ class HistoryNotesApp(ctk.CTk):
 
         # Timetracking
         self._tt_engine = TimetrackingEngine()
-        self._tt_view_mode = 'monthly'   # 'weekly' or 'monthly'
+        self._tt_view_mode = 'monthly'   # 'daily', 'weekly' or 'monthly'
         self._tt_nav_offset = 0          # 0 = current period, negative = past
-        self._tt_monthly_target = 0.0   # 0 means not set
-        self._tt_is_summary = False      # True when Summary note is open
+        self._history_window = None      # Reference to the history popup window
 
         self.geometry("1100x850")
         ctk.set_appearance_mode("dark")
@@ -429,7 +450,6 @@ class HistoryNotesApp(ctk.CTk):
         self._init_ui()
         self.update_ui_texts()
         self._ensure_special_notes()
-        self._tt_load_settings()
         self.refresh_sidebar()
         self.load_latest_or_empty()
         
@@ -508,10 +528,20 @@ class HistoryNotesApp(ctk.CTk):
         self.history_slider.pack(side="left", fill="x", expand=True)
         self.version_info = ctk.CTkLabel(self.slider_frame, width=120)
         self.version_info.pack(side="right", padx=10)
+        
+        # History button for timetracking (hidden by default, shown only on TT note)
+        self.tt_history_btn = ctk.CTkButton(
+            self.slider_frame,
+            text="📊 History",
+            width=100,
+            height=28,
+            fg_color="#2b5b84",
+            hover_color="#3a7ab5",
+            command=self.open_summary_history
+        )
 
-        # Summary toolbar (shown only when Timetracking Summary is open)
+        # Summary toolbar (shown only when Timetracking note is open)
         self.summary_toolbar = ctk.CTkFrame(self.main_content, fg_color="#1e1e2e", height=44)
-        # not gridded by default -- shown/hidden in load_note
         self._build_summary_toolbar()
 
         self._setup_markdown_tags()
@@ -566,6 +596,7 @@ class HistoryNotesApp(ctk.CTk):
         self.lang_btn.configure(text=s["lang_btn"])
         self.hist_label.configure(text=s["history_label"])
         self.version_info.configure(text=s["live"])
+        self.tt_history_btn.configure(text=s["history_btn"])
         self.menubar.entryconfig(1, label=s["menu_file_label"])
         self.file_menu.delete(0, "end")
         self.file_menu.add_command(label=s["export"], command=self.export_notes)
@@ -648,15 +679,25 @@ class HistoryNotesApp(ctk.CTk):
 
         if (new_title == self.current_title_cache) and abs(len(content) - self.last_saved_content_len) < 5: return
 
+        # Before saving Timetracking note, snapshot the current summary
+        if new_title == self.TITLE_TT:
+            self._snapshot_current_summary()
+
         self.vault.save_snapshot(self.current_note_id, new_title, content, force_history=True)
+        
+        # CHECK IF TITLE CHANGED - refresh sidebar immediately
+        title_changed = (new_title != self.current_title_cache)
         self.current_title_cache = new_title
         self.last_saved_content_len = len(content)
         self._update_history_data()
 
-        # Refresh sidebar if note is not already the topmost non-pinned entry
-        unpinned = self._sidebar_order[self._sidebar_pinned_count:]
-        if not unpinned or unpinned[0] != self.current_note_id:
+        # Refresh sidebar if title changed or note moved in order
+        if title_changed:
             self.refresh_sidebar()
+        else:
+            unpinned = self._sidebar_order[self._sidebar_pinned_count:]
+            if not unpinned or unpinned[0] != self.current_note_id:
+                self.refresh_sidebar()
 
         # Recalculate summary if Timetracking or Clients note just changed
         if new_title in (self.TITLE_TT, self.TITLE_CLIENTS):
@@ -666,6 +707,11 @@ class HistoryNotesApp(ctk.CTk):
         if not self.current_note_id or self.is_loading: return
         content = self.editor.get("0.0", "end-1c")
         title = (self.title_entry.get().strip() or self.get_str("new_note_default"))[:40]
+        
+        # Before saving Timetracking note, snapshot the current summary
+        if title == self.TITLE_TT:
+            self._snapshot_current_summary()
+            
         self.vault.save_snapshot(self.current_note_id, title, content, force_history=False)
 
     def load_note(self, nid):
@@ -679,30 +725,30 @@ class HistoryNotesApp(ctk.CTk):
             self.title_entry.delete(0, "end")
             if title and title != self.get_str("new_note_default"): self.title_entry.insert(0, title)
 
-            # Determine if this is the Summary note
-            self._tt_is_summary = (title == self.TITLE_SUMMARY)
+            # Check if this is the Timetracking note
+            is_timetracking = (title == self.TITLE_TT)
 
-            if self._tt_is_summary:
-                # Show summary toolbar, hide history panel
+            if is_timetracking:
+                # Show summary toolbar and history button in panel
                 self.summary_toolbar.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 4))
-                self.history_panel.grid_remove()
-                # Populate target entry
-                self._tt_target_entry.delete(0, "end")
-                if self._tt_monthly_target > 0:
-                    self._tt_target_entry.insert(0, str(int(self._tt_monthly_target) if self._tt_monthly_target == int(self._tt_monthly_target) else self._tt_monthly_target))
-                # Render fresh summary
+                self.history_panel.grid(row=1, column=0, sticky="ew", padx=20, pady=10)
+                self.tt_history_btn.pack(side="right", padx=(10, 0))
+                self.editor.configure(state="normal")
+                self.editor.delete("0.0", "end")
+                self.editor.insert("0.0", content)
                 self._render_summary()
-                self.editor.configure(state="disabled")
             else:
-                # Normal note: hide summary toolbar, show history panel
+                # Normal note: hide timetracking elements
                 self.summary_toolbar.grid_remove()
+                self.tt_history_btn.pack_forget()
                 self.history_panel.grid(row=1, column=0, sticky="ew", padx=20, pady=10)
                 self.editor.configure(state="normal")
                 self.editor.delete("0.0", "end")
                 self.editor.insert("0.0", content)
-                self.editor._textbox.see("1.0")
-                self.apply_markdown(full_scan=True)
-                self.update_stats()
+                
+            self.editor._textbox.see("1.0")
+            self.apply_markdown(full_scan=True)
+            self.update_stats()
 
             self.update_delete_button_state(is_deleted)
             self.last_saved_content_len = len(content)
@@ -944,29 +990,25 @@ class HistoryNotesApp(ctk.CTk):
                        activebackground="#3a3a3a", activeforeground="#ffffff",
                        bd=0, relief="flat")
 
-        if self._tt_is_summary:
-            # Summary note: Copy only
-            menu.add_command(label="Copy", command=lambda: self.editor._textbox.event_generate("<<Copy>>"))
-        else:
-            # Standard edit actions
-            menu.add_command(label="Cut",   command=lambda: self.editor._textbox.event_generate("<<Cut>>"))
-            menu.add_command(label="Copy",  command=lambda: self.editor._textbox.event_generate("<<Copy>>"))
-            menu.add_command(label="Paste", command=lambda: self.editor._textbox.event_generate("<<Paste>>"))
-            menu.add_separator()
-            menu.add_command(label="Bold",          command=lambda: self._apply_format("**", "**"))
-            menu.add_command(label="Underline",     command=lambda: self._apply_format("__", "__"))
-            menu.add_command(label="Strikethrough", command=lambda: self._apply_format("~~", "~~"))
-            menu.add_separator()
-            # Colour submenu
-            color_menu = tk.Menu(menu, tearoff=0, bg="#2b2b2b", fg="#d4d4d4",
-                                 activebackground="#3a3a3a", activeforeground="#ffffff",
-                                 bd=0, relief="flat")
-            for label, _ in self.FORMAT_COLORS:
-                tag_key = label.lower().replace(" ", "_")
-                color_menu.add_command(label=label, command=lambda k=tag_key: self._apply_color(k))
-            color_menu.add_separator()
-            color_menu.add_command(label="Remove color", command=self._remove_color)
-            menu.add_cascade(label="Color  ▶", menu=color_menu)
+        # Standard edit actions
+        menu.add_command(label="Cut",   command=lambda: self.editor._textbox.event_generate("<<Cut>>"))
+        menu.add_command(label="Copy",  command=lambda: self.editor._textbox.event_generate("<<Copy>>"))
+        menu.add_command(label="Paste", command=lambda: self.editor._textbox.event_generate("<<Paste>>"))
+        menu.add_separator()
+        menu.add_command(label="Bold",          command=lambda: self._apply_format("**", "**"))
+        menu.add_command(label="Underline",     command=lambda: self._apply_format("__", "__"))
+        menu.add_command(label="Strikethrough", command=lambda: self._apply_format("~~", "~~"))
+        menu.add_separator()
+        # Colour submenu
+        color_menu = tk.Menu(menu, tearoff=0, bg="#2b2b2b", fg="#d4d4d4",
+                             activebackground="#3a3a3a", activeforeground="#ffffff",
+                             bd=0, relief="flat")
+        for label, _ in self.FORMAT_COLORS:
+            tag_key = label.lower().replace(" ", "_")
+            color_menu.add_command(label=label, command=lambda k=tag_key: self._apply_color(k))
+        color_menu.add_separator()
+        color_menu.add_command(label="Remove color", command=self._remove_color)
+        menu.add_cascade(label="Color  ▶", menu=color_menu)
 
         try:
             menu.tk_popup(event.x_root, event.y_root)
@@ -1037,7 +1079,6 @@ class HistoryNotesApp(ctk.CTk):
     # ==========================================
     TITLE_TT       = "Timetracking"
     TITLE_CLIENTS  = "Timetracking Clients"
-    TITLE_SUMMARY  = "Timetracking Summary"
     CLIENTS_DEFAULT = "# One line per client: PREFIX = Client Name\n# Example:\n# MMS = MöbelMartin\n# LGIT = LGIT GmbH\n"
 
     def _ensure_special_notes(self):
@@ -1045,7 +1086,6 @@ class HistoryNotesApp(ctk.CTk):
         for title, default_content in [
             (self.TITLE_TT, ""),
             (self.TITLE_CLIENTS, self.CLIENTS_DEFAULT),
-            (self.TITLE_SUMMARY, ""),
         ]:
             if not self.vault.get_note_by_title(title):
                 self.vault.create_note(title, default_content)
@@ -1053,6 +1093,11 @@ class HistoryNotesApp(ctk.CTk):
     def _build_summary_toolbar(self):
         """Populate the summary_toolbar frame with navigation controls."""
         f = self.summary_toolbar
+
+        # Daily nav
+        ctk.CTkLabel(f, text="Daily", font=("Segoe UI", 12, "bold")).pack(side="left", padx=(10, 2))
+        ctk.CTkButton(f, text="◀", width=28, fg_color="gray30", command=lambda: self._tt_navigate('daily', -1)).pack(side="left", padx=1)
+        ctk.CTkButton(f, text="▶", width=28, fg_color="gray30", command=lambda: self._tt_navigate('daily', +1)).pack(side="left", padx=(1, 10))
 
         # Weekly nav
         ctk.CTkLabel(f, text="Weekly", font=("Segoe UI", 12, "bold")).pack(side="left", padx=(10, 2))
@@ -1064,13 +1109,6 @@ class HistoryNotesApp(ctk.CTk):
         ctk.CTkButton(f, text="◀", width=28, fg_color="gray30", command=lambda: self._tt_navigate('monthly', -1)).pack(side="left", padx=1)
         ctk.CTkButton(f, text="▶", width=28, fg_color="gray30", command=lambda: self._tt_navigate('monthly', +1)).pack(side="left", padx=(1, 10))
 
-        # Target
-        ctk.CTkLabel(f, text="Target (h):", font=("Segoe UI", 11)).pack(side="left", padx=(20, 4))
-        self._tt_target_entry = ctk.CTkEntry(f, width=60, font=("Segoe UI", 11))
-        self._tt_target_entry.pack(side="left")
-        self._tt_target_entry.bind("<Return>", self._tt_set_target)
-        self._tt_target_entry.bind("<FocusOut>", self._tt_set_target)
-
         # Active period label
         self._tt_period_label = ctk.CTkLabel(f, text="", font=("Segoe UI", 11), text_color="gray")
         self._tt_period_label.pack(side="right", padx=10)
@@ -1080,45 +1118,261 @@ class HistoryNotesApp(ctk.CTk):
         self._tt_nav_offset += direction
         self._render_summary()
 
-    def _tt_set_target(self, event=None):
+    def _snapshot_current_summary(self):
+        """Save the current summary as a snapshot for today before Timetracking content changes."""
         try:
-            val = float(self._tt_target_entry.get().strip())
-            self._tt_monthly_target = val
-            self.vault.set_setting('tt_monthly_target', str(val))
-        except ValueError:
-            pass
-        self._render_summary()
+            tt_row = self.vault.get_note_by_title(self.TITLE_TT)
+            cl_row = self.vault.get_note_by_title(self.TITLE_CLIENTS)
+            
+            if tt_row:
+                tt_content = tt_row[1] if tt_row else ""
+                cl_content = cl_row[1] if cl_row else ""
+                
+                # Generate summary for each date in the Timetracking content
+                engine = self._tt_engine
+                client_map = engine.parse_clients(cl_content)
+                entries, _ = engine.parse_entries(tt_content, client_map)
+                
+                # Save a snapshot for each unique date in the entries
+                unique_dates = set(e['date'] for e in entries)
+                today = date.today()
+                
+                for entry_date in unique_dates:
+                    date_str = entry_date.strftime('%d/%m/%Y')
+                    # Only save if we don't already have it or if it's today (always update today's)
+                    if not self.vault.has_summary_for_date(date_str) or entry_date == today:
+                        # Build summary for this specific date
+                        text = engine.build_summary_text(
+                            tt_content, cl_content,
+                            'daily', (entry_date - today).days
+                        )
+                        self.vault.save_summary_snapshot(date_str, text)
+        except Exception:
+            pass  # Never break the app for snapshot failures
 
     def _render_summary(self):
-        """Recalculate and write the summary into the Summary note editor and DB."""
-        tt_row = self.vault.get_note_by_title(self.TITLE_TT)
-        cl_row = self.vault.get_note_by_title(self.TITLE_CLIENTS)
-        tt_content = tt_row[1] if tt_row else ""
-        cl_content = cl_row[1] if cl_row else ""
+        """Update the summary toolbar period label."""
+        today = date.today()
+        if self._tt_view_mode == 'daily':
+            target_date = today + timedelta(days=self._tt_nav_offset)
+            period_text = target_date.strftime('%d.%m.%Y')
+        elif self._tt_view_mode == 'weekly':
+            monday = today - timedelta(days=today.weekday()) + timedelta(weeks=self._tt_nav_offset)
+            friday = monday + timedelta(days=4)
+            period_text = f"{monday.strftime('%d.%m')} – {friday.strftime('%d.%m.%Y')}"
+        else:
+            m = today.month + self._tt_nav_offset
+            y = today.year
+            while m <= 0:
+                m += 12; y -= 1
+            while m > 12:
+                m -= 12; y += 1
+            period_text = date(y, m, 1).strftime('%B %Y')
+        
+        self._tt_period_label.configure(text=period_text)
 
-        text = self._tt_engine.build_summary_text(
-            tt_content, cl_content,
-            self._tt_view_mode, self._tt_nav_offset, self._tt_monthly_target
-        )
-
-        # Update editor if Summary note is currently open (read-only bypass)
-        if self._tt_is_summary:
-            self.editor.configure(state="normal")
-            self.editor.delete("0.0", "end")
-            self.editor.insert("0.0", text)
-            self.editor.configure(state="disabled")
-
-        # Persist to DB so it's readable when closed
-        summary_row = self.vault.get_note_by_title(self.TITLE_SUMMARY)
-        if summary_row:
-            self.vault.update_note_content(summary_row[0], text)
-
-    def _tt_load_settings(self):
-        """Restore target from settings DB."""
+    # ==========================================
+    # SUMMARY HISTORY WINDOW
+    # ==========================================
+    def open_summary_history(self):
+        """Open the summary history window."""
+        if self._history_window and self._history_window.winfo_exists():
+            self._history_window.lift()
+            self._history_window.focus_force()
+            return
+        
+        self._history_window = tk.Toplevel(self)
+        self._history_window.title(f"Timetracking History - {self.get_str('title')}")
+        self._history_window.geometry("800x700")
+        self._history_window.minsize(600, 500)
+        self._history_window.configure(bg="#1a1a1a")
+        
+        # Make it a proper window with icon
         try:
-            self._tt_monthly_target = float(self.vault.get_setting('tt_monthly_target', '0'))
-        except ValueError:
-            self._tt_monthly_target = 0.0
+            if getattr(sys, 'frozen', False):
+                icon_path = Path(sys.executable).parent / 'app_icon.ico'
+            else:
+                icon_path = Path(__file__).resolve().parent / 'app_icon.ico'
+            if icon_path.exists():
+                self._history_window.iconbitmap(str(icon_path))
+        except:
+            pass
+        
+        # History window state
+        self._hist_view_mode = 'daily'
+        self._hist_nav_offset = 0
+        self._hist_custom_date = None
+        
+        # Top navigation bar
+        nav_frame = ctk.CTkFrame(self._history_window, fg_color="#1e1e2e", height=50)
+        nav_frame.pack(fill="x", padx=5, pady=5)
+        
+        # View mode buttons
+        ctk.CTkButton(
+            nav_frame, text=self.get_str("daily"), width=70,
+            command=lambda: self._set_history_mode('daily')
+        ).pack(side="left", padx=2)
+        
+        ctk.CTkButton(
+            nav_frame, text=self.get_str("weekly"), width=70,
+            command=lambda: self._set_history_mode('weekly')
+        ).pack(side="left", padx=2)
+        
+        ctk.CTkButton(
+            nav_frame, text=self.get_str("monthly"), width=70,
+            command=lambda: self._set_history_mode('monthly')
+        ).pack(side="left", padx=2)
+        
+        # Navigation arrows
+        ctk.CTkButton(
+            nav_frame, text="◀◀", width=35, fg_color="gray30",
+            command=lambda: self._navigate_history(-1)
+        ).pack(side="left", padx=(20, 2))
+        
+        ctk.CTkButton(
+            nav_frame, text="▶▶", width=35, fg_color="gray30",
+            command=lambda: self._navigate_history(1)
+        ).pack(side="left", padx=2)
+        
+        # Date input field
+        ctk.CTkLabel(nav_frame, text="Date (dd/mm/yyyy):", font=("Segoe UI", 10)).pack(side="left", padx=(20, 5))
+        self._hist_date_entry = ctk.CTkEntry(nav_frame, width=100, font=("Segoe UI", 10))
+        self._hist_date_entry.pack(side="left", padx=5)
+        self._hist_date_entry.bind("<Return>", self._hist_jump_to_date)
+        
+        ctk.CTkButton(
+            nav_frame, text="Go", width=40, fg_color="gray30",
+            command=self._hist_jump_to_date
+        ).pack(side="left", padx=2)
+        
+        # Period label
+        self._hist_period_label = ctk.CTkLabel(nav_frame, text="", font=("Segoe UI", 10), text_color="gray")
+        self._hist_period_label.pack(side="right", padx=10)
+        
+        # Content area
+        self._hist_content = ctk.CTkTextbox(
+            self._history_window, 
+            font=("Consolas", 14), 
+            fg_color="#121212",
+            wrap="none"
+        )
+        self._hist_content.pack(fill="both", expand=True, padx=10, pady=10)
+        self._hist_content.configure(state="disabled")
+        
+        # Close button at bottom
+        ctk.CTkButton(
+            self._history_window, 
+            text="Close", 
+            fg_color="gray30",
+            command=self._history_window.destroy
+        ).pack(pady=10)
+        
+        # Load initial data
+        self._update_history_display()
+        
+        # Handle window close
+        self._history_window.protocol("WM_DELETE_WINDOW", self._on_history_close)
+
+    def _on_history_close(self):
+        """Clean up when history window is closed."""
+        if self._history_window:
+            self._history_window.destroy()
+            self._history_window = None
+
+    def _set_history_mode(self, mode):
+        """Set the history view mode (daily/weekly/monthly)."""
+        self._hist_view_mode = mode
+        self._hist_nav_offset = 0
+        self._hist_custom_date = None
+        self._hist_date_entry.delete(0, "end")
+        self._update_history_display()
+
+    def _navigate_history(self, direction):
+        """Navigate forward/backward in history."""
+        self._hist_nav_offset += direction
+        self._hist_custom_date = None
+        self._hist_date_entry.delete(0, "end")
+        self._update_history_display()
+
+    def _hist_jump_to_date(self, event=None):
+        """Jump to a specific date entered in the date field."""
+        date_str = self._hist_date_entry.get().strip()
+        if not date_str:
+            return
+        
+        try:
+            parts = date_str.split('/')
+            if len(parts) == 3:
+                day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+                target_date = date(year, month, day)
+                self._hist_custom_date = target_date
+                self._hist_view_mode = 'daily'
+                self._update_history_display()
+        except (ValueError, IndexError):
+            pass  # Invalid date format, just ignore
+
+    def _update_history_display(self):
+        """Load and display history data based on current settings."""
+        today = date.today()
+        
+        # Calculate date range based on view mode and offset
+        if self._hist_custom_date:
+            if self._hist_view_mode == 'daily':
+                start_date = end_date = self._hist_custom_date
+                label = f"Daily: {start_date.strftime('%d.%m.%Y')}"
+            elif self._hist_view_mode == 'weekly':
+                monday = self._hist_custom_date - timedelta(days=self._hist_custom_date.weekday())
+                friday = monday + timedelta(days=4)
+                start_date, end_date = monday, friday
+                label = f"Week: {monday.strftime('%d.%m')} – {friday.strftime('%d.%m.%Y')}"
+            else:  # monthly
+                start_date = date(self._hist_custom_date.year, self._hist_custom_date.month, 1)
+                last_day = calendar.monthrange(self._hist_custom_date.year, self._hist_custom_date.month)[1]
+                end_date = date(self._hist_custom_date.year, self._hist_custom_date.month, last_day)
+                label = f"Month: {start_date.strftime('%B %Y')}"
+        else:
+            if self._hist_view_mode == 'daily':
+                target_date = today + timedelta(days=self._hist_nav_offset)
+                start_date = end_date = target_date
+                label = f"Daily: {target_date.strftime('%d.%m.%Y')}"
+            elif self._hist_view_mode == 'weekly':
+                monday = today - timedelta(days=today.weekday()) + timedelta(weeks=self._hist_nav_offset)
+                friday = monday + timedelta(days=4)
+                start_date, end_date = monday, friday
+                label = f"Week: {monday.strftime('%d.%m')} – {friday.strftime('%d.%m.%Y')}"
+            else:  # monthly
+                m = today.month + self._hist_nav_offset
+                y = today.year
+                while m <= 0:
+                    m += 12; y -= 1
+                while m > 12:
+                    m -= 12; y += 1
+                start_date = date(y, m, 1)
+                last_day = calendar.monthrange(y, m)[1]
+                end_date = date(y, m, last_day)
+                label = f"Month: {start_date.strftime('%B %Y')}"
+        
+        self._hist_period_label.configure(text=label)
+        
+        # Fetch snapshots for the date range
+        start_str = start_date.strftime('%d/%m/%Y')
+        end_str = end_date.strftime('%d/%m/%Y')
+        snapshots = self.vault.get_summary_snapshots(start_str, end_str)
+        
+        # Display the snapshots
+        self._hist_content.configure(state="normal")
+        self._hist_content.delete("1.0", "end")
+        
+        if not snapshots:
+            self._hist_content.insert("1.0", self.get_str("no_history"))
+        else:
+            for i, (date_key, content) in enumerate(snapshots):
+                if i > 0:
+                    self._hist_content.insert("end", "\n\n" + "=" * 50 + "\n\n")
+                self._hist_content.insert("end", content)
+        
+        self._hist_content.configure(state="disabled")
+
 
 if __name__ == "__main__":
     app = HistoryNotesApp()
