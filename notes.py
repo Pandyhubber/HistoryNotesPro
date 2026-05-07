@@ -215,8 +215,8 @@ class TimetrackingEngine:
         PREFIX = Client Name
     """
 
-    # Matches a time value at the start: 1h, 1.5h, 0.5h etc.
-    _TIME_RE = re.compile(r'^(\d+(?:\.\d+)?)h\s+', re.IGNORECASE)
+    # Matches a time value at the start: 1h, 1.5h, 1,5h, 0.5h etc.
+    _TIME_RE = re.compile(r'^(\d+(?:[.,]\d+)?)h\s+', re.IGNORECASE)
     # Looks like a time entry but may be malformed
     _LOOKS_LIKE_ENTRY_RE = re.compile(r'^\d', re.IGNORECASE)
     # Date marker: --- DD.MM.YYYY ---
@@ -271,7 +271,7 @@ class TimetrackingEngine:
                 warnings.append(f"Line {lineno}: unparseable  \"{raw.rstrip()}\"")
                 continue
 
-            hours = float(tm.group(1))
+            hours = float(tm.group(1).replace(',', '.'))
             rest = line[tm.end():].strip()
             if not rest:
                 warnings.append(f"Line {lineno}: unparseable (no ticket)  \"{raw.rstrip()}\"")
@@ -440,8 +440,6 @@ class HistoryNotesApp(ctk.CTk):
 
         # Timetracking
         self._tt_engine = TimetrackingEngine()
-        self._tt_view_mode = 'monthly'   # 'daily', 'weekly' or 'monthly'
-        self._tt_nav_offset = 0          # 0 = current period, negative = past
         self._history_window = None      # Reference to the history popup window
 
         self.geometry("1100x850")
@@ -539,10 +537,6 @@ class HistoryNotesApp(ctk.CTk):
             hover_color="#3a7ab5",
             command=self.open_summary_history
         )
-
-        # Summary toolbar (shown only when Timetracking note is open)
-        self.summary_toolbar = ctk.CTkFrame(self.main_content, fg_color="#1e1e2e", height=44)
-        self._build_summary_toolbar()
 
         self._setup_markdown_tags()
 
@@ -699,9 +693,6 @@ class HistoryNotesApp(ctk.CTk):
             if not unpinned or unpinned[0] != self.current_note_id:
                 self.refresh_sidebar()
 
-        # Recalculate summary if Timetracking or Clients note just changed
-        if new_title in (self.TITLE_TT, self.TITLE_CLIENTS):
-            self._render_summary()
 
     def force_save(self):
         if not self.current_note_id or self.is_loading: return
@@ -729,17 +720,14 @@ class HistoryNotesApp(ctk.CTk):
             is_timetracking = (title == self.TITLE_TT)
 
             if is_timetracking:
-                # Show summary toolbar and history button in panel
-                self.summary_toolbar.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 4))
+                # Show history button in panel
                 self.history_panel.grid(row=1, column=0, sticky="ew", padx=20, pady=10)
                 self.tt_history_btn.pack(side="right", padx=(10, 0))
                 self.editor.configure(state="normal")
                 self.editor.delete("0.0", "end")
                 self.editor.insert("0.0", content)
-                self._render_summary()
             else:
                 # Normal note: hide timetracking elements
-                self.summary_toolbar.grid_remove()
                 self.tt_history_btn.pack_forget()
                 self.history_panel.grid(row=1, column=0, sticky="ew", padx=20, pady=10)
                 self.editor.configure(state="normal")
@@ -1090,34 +1078,6 @@ class HistoryNotesApp(ctk.CTk):
             if not self.vault.get_note_by_title(title):
                 self.vault.create_note(title, default_content)
 
-    def _build_summary_toolbar(self):
-        """Populate the summary_toolbar frame with navigation controls."""
-        f = self.summary_toolbar
-
-        # Daily nav
-        ctk.CTkLabel(f, text="Daily", font=("Segoe UI", 12, "bold")).pack(side="left", padx=(10, 2))
-        ctk.CTkButton(f, text="◀", width=28, fg_color="gray30", command=lambda: self._tt_navigate('daily', -1)).pack(side="left", padx=1)
-        ctk.CTkButton(f, text="▶", width=28, fg_color="gray30", command=lambda: self._tt_navigate('daily', +1)).pack(side="left", padx=(1, 10))
-
-        # Weekly nav
-        ctk.CTkLabel(f, text="Weekly", font=("Segoe UI", 12, "bold")).pack(side="left", padx=(10, 2))
-        ctk.CTkButton(f, text="◀", width=28, fg_color="gray30", command=lambda: self._tt_navigate('weekly', -1)).pack(side="left", padx=1)
-        ctk.CTkButton(f, text="▶", width=28, fg_color="gray30", command=lambda: self._tt_navigate('weekly', +1)).pack(side="left", padx=(1, 10))
-
-        # Monthly nav
-        ctk.CTkLabel(f, text="Monthly", font=("Segoe UI", 12, "bold")).pack(side="left", padx=(10, 2))
-        ctk.CTkButton(f, text="◀", width=28, fg_color="gray30", command=lambda: self._tt_navigate('monthly', -1)).pack(side="left", padx=1)
-        ctk.CTkButton(f, text="▶", width=28, fg_color="gray30", command=lambda: self._tt_navigate('monthly', +1)).pack(side="left", padx=(1, 10))
-
-        # Active period label
-        self._tt_period_label = ctk.CTkLabel(f, text="", font=("Segoe UI", 11), text_color="gray")
-        self._tt_period_label.pack(side="right", padx=10)
-
-    def _tt_navigate(self, mode: str, direction: int):
-        self._tt_view_mode = mode
-        self._tt_nav_offset += direction
-        self._render_summary()
-
     def _snapshot_current_summary(self):
         """Save the current summary as a snapshot for today before Timetracking content changes."""
         try:
@@ -1149,27 +1109,6 @@ class HistoryNotesApp(ctk.CTk):
                         self.vault.save_summary_snapshot(date_str, text)
         except Exception:
             pass  # Never break the app for snapshot failures
-
-    def _render_summary(self):
-        """Update the summary toolbar period label."""
-        today = date.today()
-        if self._tt_view_mode == 'daily':
-            target_date = today + timedelta(days=self._tt_nav_offset)
-            period_text = target_date.strftime('%d.%m.%Y')
-        elif self._tt_view_mode == 'weekly':
-            monday = today - timedelta(days=today.weekday()) + timedelta(weeks=self._tt_nav_offset)
-            friday = monday + timedelta(days=4)
-            period_text = f"{monday.strftime('%d.%m')} – {friday.strftime('%d.%m.%Y')}"
-        else:
-            m = today.month + self._tt_nav_offset
-            y = today.year
-            while m <= 0:
-                m += 12; y -= 1
-            while m > 12:
-                m -= 12; y += 1
-            period_text = date(y, m, 1).strftime('%B %Y')
-        
-        self._tt_period_label.configure(text=period_text)
 
     # ==========================================
     # SUMMARY HISTORY WINDOW
