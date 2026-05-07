@@ -1,7 +1,8 @@
 # 📝 History Notes Pro
 
 A lightweight, efficient tool for capturing and organizing your history notes.
-V9 = General use, less features
+
+V9 = General light use, less features
 
 ---
 
