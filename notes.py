@@ -6,10 +6,35 @@ import re
 import webbrowser
 import sys
 import ctypes
+import logging
+import threading
+import queue
+import hashlib
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from tkinter import messagebox, filedialog
 import calendar
+
+# ==========================================
+# LOGGING SETUP
+# ==========================================
+def _setup_logging():
+    if getattr(sys, 'frozen', False):
+        log_dir = Path(sys.executable).parent
+    else:
+        log_dir = Path(__file__).resolve().parent
+    log_path = log_dir / 'historynotespro.log'
+    logging.basicConfig(
+        level=logging.WARNING,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(log_path, encoding='utf-8'),
+            logging.StreamHandler(sys.stdout),
+        ]
+    )
+
+_setup_logging()
+log = logging.getLogger(__name__)
 
 # ==========================================
 # TASKBAR ICON FIX (AppUserModelID)
@@ -52,122 +77,210 @@ STR_TABLE = {
 # 2. DATA ACCESS LAYER
 # ==========================================
 class NoteVault:
+    """
+    Thread-safe SQLite access.
+    - WAL mode is set once on the main-thread read connection before the
+      writer thread starts, so there is no lock contention on startup.
+    - All writes are serialised through a queue served by a single writer
+      thread; reads run on the caller (main) thread.
+    """
     def __init__(self, db_path: Path):
-        self.conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
+        self._db_path = db_path
+        # Open + configure the read connection first, while no writer exists yet
+        self._rconn = sqlite3.connect(str(db_path), timeout=30, check_same_thread=False)
+        self._rconn.execute("PRAGMA journal_mode=WAL")
+        self._rconn.commit()
+        # Now start the writer thread (it opens its own connection, WAL already set)
+        self._write_queue: queue.Queue = queue.Queue()
+        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._writer_thread.start()
         self._setup_db()
 
-    def _setup_db(self):
-        with self.conn:
-            self.conn.execute('CREATE TABLE IF NOT EXISTS note_list (id INTEGER PRIMARY KEY, title TEXT, pinned INTEGER DEFAULT 0, is_deleted INTEGER DEFAULT 0, last_content TEXT, last_updated TEXT)')
-            self.conn.execute('CREATE TABLE IF NOT EXISTS history (note_id INTEGER, content TEXT, timestamp TEXT)')
-            self.conn.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
-            self.conn.execute('CREATE TABLE IF NOT EXISTS summary_history (date TEXT PRIMARY KEY, content TEXT, created_at TEXT)')
-            
-            cursor = self.conn.execute("SELECT COUNT(*) FROM note_list")
-            if cursor.fetchone()[0] == 0:
-                lang = self.get_setting("lang", "EN")
-                self.create_note(STR_TABLE[lang]["welcome_title"], STR_TABLE[lang]["welcome_text"])
+    # ------------------------------------------------------------------
+    # Writer thread
+    # ------------------------------------------------------------------
+    def _writer_loop(self):
+        wconn = sqlite3.connect(str(self._db_path), timeout=30, check_same_thread=False)
+        while True:
+            item = self._write_queue.get()
+            if item is None:          # poison pill
+                wconn.close()
+                break
+            sql, params, evt, box = item
+            try:
+                with wconn:
+                    wconn.execute(sql, params)
+                if box is not None:
+                    box.append(None)
+            except Exception as e:
+                log.error("DB write error: %s | sql=%s params=%s", e, sql, params)
+                if box is not None:
+                    box.append(e)
+            finally:
+                if evt:
+                    evt.set()
 
+    def _write(self, sql: str, params: tuple = ()):
+        """Fire-and-forget write."""
+        self._write_queue.put((sql, params, None, None))
+
+    def _write_sync(self, sql: str, params: tuple = ()):
+        """Blocking write -- waits for completion, re-raises on error."""
+        evt = threading.Event()
+        box: list = []
+        self._write_queue.put((sql, params, evt, box))
+        evt.wait()
+        if box and isinstance(box[0], Exception):
+            raise box[0]
+
+    def close(self):
+        self._write_queue.put(None)
+        self._writer_thread.join(timeout=3)
+        self._rconn.close()
+
+    # ------------------------------------------------------------------
+    # Schema setup
+    # ------------------------------------------------------------------
+    def _setup_db(self):
+        for sql in [
+            'CREATE TABLE IF NOT EXISTS note_list (id INTEGER PRIMARY KEY, title TEXT, pinned INTEGER DEFAULT 0, is_deleted INTEGER DEFAULT 0, last_content TEXT, last_updated TEXT)',
+            'CREATE TABLE IF NOT EXISTS history (note_id INTEGER, content TEXT, timestamp TEXT)',
+            'CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)',
+            'CREATE TABLE IF NOT EXISTS summary_history (date TEXT PRIMARY KEY, content TEXT, created_at TEXT)',
+            'CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)',
+        ]:
+            self._write_sync(sql)
+        if not self._rconn.execute("SELECT version FROM schema_version").fetchone():
+            self._write_sync("INSERT OR IGNORE INTO schema_version (version) VALUES (1)")
+        if self._rconn.execute("SELECT COUNT(*) FROM note_list").fetchone()[0] == 0:
+            lang = self.get_setting("lang", "EN")
+            self.create_note(STR_TABLE[lang]["welcome_title"], STR_TABLE[lang]["welcome_text"])
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def get_setting(self, key: str, default: str) -> str:
-        res = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        res = self._rconn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return res[0] if res else default
 
     def set_setting(self, key: str, value: str):
-        with self.conn:
-            self.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+        self._write("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
 
     def fetch_sidebar_notes(self, search_term: str, show_archived: bool):
         f = 1 if show_archived else 0
         q = f"SELECT id, title, pinned, is_deleted FROM note_list WHERE is_deleted = {f}"
         p = []
-        if search_term: 
+        if search_term:
             q += " AND (LOWER(title) LIKE ? OR LOWER(last_content) LIKE ?)"
             p = [f'%{search_term}%', f'%{search_term}%']
         q += " ORDER BY pinned DESC, last_updated DESC"
-        return self.conn.execute(q, p).fetchall()
+        return self._rconn.execute(q, p).fetchall()
 
     def get_note(self, nid: int):
-        return self.conn.execute("SELECT title, last_content, is_deleted FROM note_list WHERE id = ?", (nid,)).fetchone()
+        return self._rconn.execute("SELECT title, last_content, is_deleted FROM note_list WHERE id = ?", (nid,)).fetchone()
 
     def get_history(self, nid: int):
-        rows = self.conn.execute("SELECT timestamp, content FROM history WHERE note_id = ? ORDER BY timestamp ASC", (nid,)).fetchall()
+        rows = self._rconn.execute("SELECT timestamp, content FROM history WHERE note_id = ? ORDER BY timestamp ASC", (nid,)).fetchall()
         return [(r[0][11:16] if 'T' in r[0] else r[0][:16], r[1]) for r in rows]
+
+    def get_history_count(self, nid: int) -> int:
+        """Lightweight count -- avoids fetching all content rows on every save."""
+        row = self._rconn.execute("SELECT COUNT(*) FROM history WHERE note_id = ?", (nid,)).fetchone()
+        return row[0] if row else 0
 
     def save_snapshot(self, nid: int, title: str, content: str, force_history: bool = False):
         now_str = datetime.now().isoformat()
-        with self.conn:
-            self.conn.execute("UPDATE note_list SET title = ?, last_content = ?, last_updated = ? WHERE id = ?", (title, content, now_str, nid))
-            if force_history:
-                last = self.conn.execute("SELECT content FROM history WHERE note_id = ? ORDER BY timestamp DESC LIMIT 1", (nid,)).fetchone()
-                if not last or last[0] != content:
-                    self.conn.execute("INSERT INTO history (note_id, content, timestamp) VALUES (?, ?, ?)", (nid, content, now_str))
+        self._write("UPDATE note_list SET title = ?, last_content = ?, last_updated = ? WHERE id = ?",
+                    (title, content, now_str, nid))
+        if force_history:
+            last = self._rconn.execute(
+                "SELECT content FROM history WHERE note_id = ? ORDER BY timestamp DESC LIMIT 1", (nid,)
+            ).fetchone()
+            if not last or last[0] != content:
+                self._write("INSERT INTO history (note_id, content, timestamp) VALUES (?, ?, ?)",
+                            (nid, content, now_str))
 
     def create_note(self, title: str, content: str = "") -> int:
+        """Synchronous insert so we can return the new id."""
         now_str = datetime.now().isoformat()
-        with self.conn:
-            c = self.conn.cursor()
-            c.execute("INSERT INTO note_list (title, last_content, last_updated) VALUES (?, ?, ?)", (title, content, now_str))
-            return c.lastrowid
+        evt = threading.Event()
+        box: list = []
+        def _do():
+            try:
+                conn = sqlite3.connect(str(self._db_path), timeout=30)
+                with conn:
+                    c = conn.cursor()
+                    c.execute("INSERT INTO note_list (title, last_content, last_updated) VALUES (?, ?, ?)",
+                              (title, content, now_str))
+                    box.append(c.lastrowid)
+                conn.close()
+            except Exception as e:
+                log.error("create_note error: %s", e)
+                box.append(None)
+            finally:
+                evt.set()
+        threading.Thread(target=_do, daemon=True).start()
+        evt.wait()
+        return box[0]
 
     def delete_note_soft(self, nid: int):
-        with self.conn:
-            self.conn.execute("UPDATE note_list SET is_deleted = 1, pinned = 0 WHERE id = ?", (nid,))
+        self._write("UPDATE note_list SET is_deleted = 1, pinned = 0 WHERE id = ?", (nid,))
 
     def delete_note_hard(self, nid: int):
-        with self.conn:
-            self.conn.execute("DELETE FROM note_list WHERE id = ?", (nid,))
-            self.conn.execute("DELETE FROM history WHERE note_id = ?", (nid,))
+        self._write("DELETE FROM note_list WHERE id = ?", (nid,))
+        self._write("DELETE FROM history WHERE note_id = ?", (nid,))
 
     def restore_note(self, nid: int):
-        with self.conn:
-            self.conn.execute("UPDATE note_list SET is_deleted = 0 WHERE id = ?", (nid,))
+        self._write("UPDATE note_list SET is_deleted = 0 WHERE id = ?", (nid,))
 
     def toggle_pin(self, nid: int):
-        with self.conn:
-            self.conn.execute("UPDATE note_list SET pinned = 1 - pinned WHERE id = ?", (nid,))
+        self._write("UPDATE note_list SET pinned = 1 - pinned WHERE id = ?", (nid,))
 
     def get_latest_active_id(self):
-        row = self.conn.execute("SELECT id FROM note_list WHERE is_deleted = 0 ORDER BY pinned DESC, last_updated DESC LIMIT 1").fetchone()
+        row = self._rconn.execute(
+            "SELECT id FROM note_list WHERE is_deleted = 0 ORDER BY pinned DESC, last_updated DESC LIMIT 1"
+        ).fetchone()
         return row[0] if row else None
 
     def get_export_data(self):
-        return self.conn.execute("SELECT title, last_content FROM note_list WHERE is_deleted = 0").fetchall()
+        return self._rconn.execute("SELECT title, last_content FROM note_list WHERE is_deleted = 0").fetchall()
 
     def get_note_by_title(self, title: str):
-        row = self.conn.execute("SELECT id, last_content FROM note_list WHERE title = ? AND is_deleted = 0 LIMIT 1", (title,)).fetchone()
-        return row  # (id, content) or None
+        row = self._rconn.execute(
+            "SELECT id, last_content FROM note_list WHERE title = ? AND is_deleted = 0 LIMIT 1", (title,)
+        ).fetchone()
+        return row
 
     def update_note_content(self, nid: int, content: str):
         now_str = datetime.now().isoformat()
-        with self.conn:
-            self.conn.execute("UPDATE note_list SET last_content = ?, last_updated = ? WHERE id = ?", (content, now_str, nid))
+        self._write("UPDATE note_list SET last_content = ?, last_updated = ? WHERE id = ?",
+                    (content, now_str, nid))
 
-    # === Summary History Methods ===
+    # === Summary History ===
     def save_summary_snapshot(self, date_key: str, content: str):
-        """Save a summary snapshot for a specific date (DD/MM/YYYY format)."""
         now_str = datetime.now().isoformat()
-        with self.conn:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO summary_history (date, content, created_at) VALUES (?, ?, ?)",
-                (date_key, content, now_str)
-            )
+        self._write(
+            "INSERT OR REPLACE INTO summary_history (date, content, created_at) VALUES (?, ?, ?)",
+            (date_key, content, now_str)
+        )
 
     def get_summary_snapshots(self, start_date: str = None, end_date: str = None):
-        """Get summary snapshots in date range (DD/MM/YYYY format strings)."""
         if start_date and end_date:
-            q = "SELECT date, content FROM summary_history WHERE date >= ? AND date <= ? ORDER BY date ASC"
-            return self.conn.execute(q, (start_date, end_date)).fetchall()
-        else:
-            return self.conn.execute("SELECT date, content FROM summary_history ORDER BY date ASC").fetchall()
+            return self._rconn.execute(
+                "SELECT date, content FROM summary_history WHERE date >= ? AND date <= ? ORDER BY date ASC",
+                (start_date, end_date)
+            ).fetchall()
+        return self._rconn.execute(
+            "SELECT date, content FROM summary_history ORDER BY date ASC"
+        ).fetchall()
 
     def get_latest_summary_snapshot(self):
-        """Get the most recent summary snapshot."""
-        row = self.conn.execute("SELECT date, content FROM summary_history ORDER BY date DESC LIMIT 1").fetchone()
-        return row
+        return self._rconn.execute(
+            "SELECT date, content FROM summary_history ORDER BY date DESC LIMIT 1"
+        ).fetchone()
 
     def has_summary_for_date(self, date_key: str) -> bool:
-        """Check if summary exists for a specific date."""
-        row = self.conn.execute("SELECT 1 FROM summary_history WHERE date = ?", (date_key,)).fetchone()
+        row = self._rconn.execute("SELECT 1 FROM summary_history WHERE date = ?", (date_key,)).fetchone()
         return row is not None
 
 
@@ -187,7 +300,8 @@ class NoteButton(ctk.CTkFrame):
         self.update_data(title, pinned)
         
         self.btn.bind("<Enter>", lambda e: self.pin_mini.pack(side="right", padx=5) if not is_deleted else None)
-        self.bind("<Leave>", lambda e: self.pin_mini.pack_forget())
+        self.btn.bind("<Leave>", lambda e: self.pin_mini.pack_forget())
+        self.pin_mini.bind("<Leave>", lambda e: self.pin_mini.pack_forget())
 
     def update_data(self, title, pinned):
         display = (title if title and title.strip() else "...").replace("\n", " ")
@@ -441,6 +555,7 @@ class HistoryNotesApp(ctk.CTk):
         # Timetracking
         self._tt_engine = TimetrackingEngine()
         self._history_window = None      # Reference to the history popup window
+        self._last_tt_content_hash: str = ""  # skip redundant TT snapshots
 
         self.geometry("1100x850")
         ctk.set_appearance_mode("dark")
@@ -450,9 +565,18 @@ class HistoryNotesApp(ctk.CTk):
         self._ensure_special_notes()
         self.refresh_sidebar()
         self.load_latest_or_empty()
+
+        # Restore window geometry from last session
+        saved_geo = self.vault.get_setting("window_geometry", "")
+        if saved_geo:
+            try:
+                self.geometry(saved_geo)
+            except Exception:
+                pass
         
         self.bind("<Control-f>", self.focus_search)
         self.bind("<Control-s>", self.manual_save)
+        self.protocol("WM_DELETE_WINDOW", self._on_app_close)
 
     def _init_ui(self):
         self.menubar = tk.Menu(self)
@@ -636,11 +760,16 @@ class HistoryNotesApp(ctk.CTk):
                     if not url.startswith(('http://', 'https://')): url = 'https://' + url
                     webbrowser.open(url)
                     break
-        except: pass
+        except Exception as e:
+            log.warning("open_url error: %s", e)
 
     def _on_slider_move(self, val):
-        if not self.history_snapshots: return
-        self.is_loading = True 
+        if not self.current_note_id:
+            return
+        self._ensure_history_snapshots_loaded()
+        if not self.history_snapshots:
+            return
+        self.is_loading = True
         idx = int(val)
         if idx >= len(self.history_snapshots):
             self.version_info.configure(text=self.get_str("live"), text_color="white")
@@ -744,12 +873,20 @@ class HistoryNotesApp(ctk.CTk):
         self.is_loading = False
 
     def _update_history_data(self):
-        if not self.current_note_id: return
-        self.history_snapshots = self.vault.get_history(self.current_note_id)
-        count = len(self.history_snapshots)
+        if not self.current_note_id:
+            return
+        # Count-only query -- avoids loading all content on every auto-save
+        count = self.vault.get_history_count(self.current_note_id)
+        self.history_snapshots = []   # lazy: loaded on first slider touch
         if count > 0:
             self.history_slider.configure(from_=0, to=count, number_of_steps=count)
-            if not self.is_loading: self.history_slider.set(count)
+            if not self.is_loading:
+                self.history_slider.set(count)
+
+    def _ensure_history_snapshots_loaded(self):
+        """Load full snapshot content only when the slider is actually moved."""
+        if not self.history_snapshots and self.current_note_id:
+            self.history_snapshots = self.vault.get_history(self.current_note_id)
 
     def handle_delete_action(self):
         if not self.current_note_id: return
@@ -893,7 +1030,8 @@ class HistoryNotesApp(ctk.CTk):
             if search_query:
                 for m in re.finditer(re.escape(search_query), content, re.I):
                     self.editor.tag_add("search_match", f"{start_idx} + {m.start()} chars", f"{start_idx} + {m.end()} chars")
-        except: pass
+        except Exception as e:
+            log.debug("apply_markdown error: %s", e)
 
     def create_new_note(self):
         nid = self.vault.create_note(self.get_str("new_note_default"))
@@ -965,6 +1103,21 @@ class HistoryNotesApp(ctk.CTk):
         m.add_command(label="── Formatting syntax ──", state="disabled")
         for label, syntax_str in syntax:
             m.add_command(label=f"{label:<22}{syntax_str}", state="disabled")
+
+    def _on_app_close(self):
+        """Flush pending edits before exit -- no keystrokes lost."""
+        try:
+            if self._after_id_save:
+                self.after_cancel(self._after_id_save)
+            if self._after_id_format:
+                self.after_cancel(self._after_id_format)
+            self.force_save()
+            self.vault.set_setting("window_geometry", self.geometry())
+            self.vault.close()
+        except Exception as e:
+            log.error("Shutdown error: %s", e)
+        finally:
+            self.destroy()
 
     def load_latest_or_empty(self):
         nid = self.vault.get_latest_active_id()
@@ -1079,36 +1232,33 @@ class HistoryNotesApp(ctk.CTk):
                 self.vault.create_note(title, default_content)
 
     def _snapshot_current_summary(self):
-        """Save the current summary as a snapshot for today before Timetracking content changes."""
+        """Save TT summary snapshots. Skips if content unchanged since last call."""
         try:
             tt_row = self.vault.get_note_by_title(self.TITLE_TT)
             cl_row = self.vault.get_note_by_title(self.TITLE_CLIENTS)
-            
-            if tt_row:
-                tt_content = tt_row[1] if tt_row else ""
-                cl_content = cl_row[1] if cl_row else ""
-                
-                # Generate summary for each date in the Timetracking content
-                engine = self._tt_engine
-                client_map = engine.parse_clients(cl_content)
-                entries, _ = engine.parse_entries(tt_content, client_map)
-                
-                # Save a snapshot for each unique date in the entries
-                unique_dates = set(e['date'] for e in entries)
-                today = date.today()
-                
-                for entry_date in unique_dates:
-                    date_str = entry_date.strftime('%d/%m/%Y')
-                    # Only save if we don't already have it or if it's today (always update today's)
-                    if not self.vault.has_summary_for_date(date_str) or entry_date == today:
-                        # Build summary for this specific date
-                        text = engine.build_summary_text(
-                            tt_content, cl_content,
-                            'daily', (entry_date - today).days
-                        )
-                        self.vault.save_summary_snapshot(date_str, text)
-        except Exception:
-            pass  # Never break the app for snapshot failures
+            if not tt_row:
+                return
+            tt_content = tt_row[1] or ""
+            cl_content = cl_row[1] if cl_row else ""
+            # Skip expensive parse when nothing changed
+            content_hash = hashlib.md5((tt_content + cl_content).encode()).hexdigest()
+            if content_hash == self._last_tt_content_hash:
+                return
+            self._last_tt_content_hash = content_hash
+            engine = self._tt_engine
+            client_map = engine.parse_clients(cl_content)
+            entries, _ = engine.parse_entries(tt_content, client_map)
+            unique_dates = set(e['date'] for e in entries)
+            today = date.today()
+            for entry_date in unique_dates:
+                date_str = entry_date.strftime('%d/%m/%Y')
+                if not self.vault.has_summary_for_date(date_str) or entry_date == today:
+                    text = engine.build_summary_text(
+                        tt_content, cl_content, 'daily', (entry_date - today).days
+                    )
+                    self.vault.save_summary_snapshot(date_str, text)
+        except Exception as e:
+            log.error("_snapshot_current_summary error: %s", e)
 
     # ==========================================
     # SUMMARY HISTORY WINDOW
@@ -1134,8 +1284,8 @@ class HistoryNotesApp(ctk.CTk):
                 icon_path = Path(__file__).resolve().parent / 'app_icon.ico'
             if icon_path.exists():
                 self._history_window.iconbitmap(str(icon_path))
-        except:
-            pass
+        except Exception as e:
+            log.debug("History window icon error: %s", e)
         
         # History window state
         self._hist_view_mode = 'daily'
