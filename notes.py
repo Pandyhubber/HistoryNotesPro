@@ -1146,22 +1146,6 @@ class HistoryNotesApp(ctk.CTk):
         nav_frame = ctk.CTkFrame(self._history_window, fg_color="#1e1e2e", height=50)
         nav_frame.pack(fill="x", padx=5, pady=5)
         
-        # View mode buttons
-        ctk.CTkButton(
-            nav_frame, text=self.get_str("daily"), width=70,
-            command=lambda: self._set_history_mode('daily')
-        ).pack(side="left", padx=2)
-        
-        ctk.CTkButton(
-            nav_frame, text=self.get_str("weekly"), width=70,
-            command=lambda: self._set_history_mode('weekly')
-        ).pack(side="left", padx=2)
-        
-        ctk.CTkButton(
-            nav_frame, text=self.get_str("monthly"), width=70,
-            command=lambda: self._set_history_mode('monthly')
-        ).pack(side="left", padx=2)
-        
         # Navigation arrows
         ctk.CTkButton(
             nav_frame, text="◀◀", width=35, fg_color="gray30",
