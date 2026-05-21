@@ -51,7 +51,7 @@ except Exception:
 STR_TABLE = {
     "EN": {
         "title": "HistoryNotes PRO", "new": "+ New Note", "del": "Archive", "final_del": "Delete Permanently",
-        "restore": "Restore", "pin": "📌", "unpin": "✕", "live": "Live",
+        "restore": "Restore", "pin": "Pin", "unpin": "Unpin", "live": "Live",
         "lang_btn": "Language: EN", "menu_file": "File", "export": "Export (.zip)", 
         "import": "Import (.txt/.zip)", "stats": "Words: {} | Chars: {}", 
         "confirm_del": "Delete note permanently?", "history_label": "History Version",
@@ -62,7 +62,7 @@ STR_TABLE = {
     },
     "DE": {
         "title": "HistoryNotes PRO", "new": "+ Neue Notiz", "del": "Archivieren", "final_del": "Endgültig Löschen",
-        "restore": "Wiederherstellen", "pin": "📌", "unpin": "✕", "live": "Live",
+        "restore": "Wiederherstellen", "pin": "Pinnen", "unpin": "Entpinnen", "live": "Live",
         "lang_btn": "Sprache: DE", "menu_file": "Datei", "export": "Export (.zip)", 
         "import": "Import (.txt/.zip)", "stats": "Wörter: {} | Zeichen: {}", 
         "confirm_del": "Notiz wirklich endgültig löschen?", "history_label": "Versionsverlauf",
@@ -234,7 +234,7 @@ class NoteVault:
         self._write("UPDATE note_list SET is_deleted = 0 WHERE id = ?", (nid,))
 
     def toggle_pin(self, nid: int):
-        self._write("UPDATE note_list SET pinned = 1 - pinned WHERE id = ?", (nid,))
+        self._write_sync("UPDATE note_list SET pinned = 1 - pinned WHERE id = ?", (nid,))
 
     def get_latest_active_id(self):
         row = self._rconn.execute(
@@ -292,21 +292,28 @@ class NoteButton(ctk.CTkFrame):
         super().__init__(master, fg_color="transparent")
         self.note_id = note_id
         self.get_str = get_str_cmd
-        
+        self._pinned = pinned
+        self._pin_cmd = pin_cmd
+        self._is_deleted = is_deleted
+
         self.btn = ctk.CTkButton(self, anchor="w", text="", fg_color="transparent", hover_color="gray30", command=lambda: select_cmd(note_id))
         self.btn.pack(side="left", fill="x", expand=True)
-        
-        self.pin_mini = ctk.CTkButton(self, width=25, height=25, text="", fg_color="gray25", hover_color="gray40", command=lambda: pin_cmd(note_id))
         self.update_data(title, pinned)
-        
-        self.btn.bind("<Enter>", lambda e: self.pin_mini.pack(side="right", padx=5) if not is_deleted else None)
-        self.btn.bind("<Leave>", lambda e: self.pin_mini.pack_forget())
-        self.pin_mini.bind("<Leave>", lambda e: self.pin_mini.pack_forget())
+
+        if not is_deleted:
+            self.btn.bind("<Button-3>", self._show_pin_menu)
+            self.bind("<Button-3>", self._show_pin_menu)
+
+    def _show_pin_menu(self, event):
+        menu = tk.Menu(self, tearoff=0)
+        label = self.get_str("unpin") if self._pinned else self.get_str("pin")
+        menu.add_command(label=label, command=lambda: self._pin_cmd(self.note_id))
+        menu.tk_popup(event.x_root, event.y_root)
 
     def update_data(self, title, pinned):
+        self._pinned = pinned
         display = (title if title and title.strip() else "...").replace("\n", " ")
         self.btn.configure(text=f"{'📌 ' if pinned else ''}{display}")
-        self.pin_mini.configure(text=self.get_str("pin") if not pinned else self.get_str("unpin"))
 
 
 # ==========================================
@@ -333,8 +340,8 @@ class TimetrackingEngine:
     _TIME_RE = re.compile(r'^(\d+(?:[.,]\d+)?)h\s+', re.IGNORECASE)
     # Looks like a time entry but may be malformed
     _LOOKS_LIKE_ENTRY_RE = re.compile(r'^\d', re.IGNORECASE)
-    # Date marker: --- DD.MM.YYYY ---
-    _DATE_RE = re.compile(r'^---\s*(\d{2})\.(\d{2})\.(\d{4})\s*---$')
+    # Date marker: --- DD.MM.YYYY --- (optionally followed by a total annotation)
+    _DATE_RE = re.compile(r'^---\s*(\d{2})\.(\d{2})\.(\d{4})\s*---')
     # Client mapping line: PREFIX = Name
     _CLIENT_RE = re.compile(r'^\s*([A-Z0-9]+)\s*=\s*(.+)$', re.IGNORECASE)
 
@@ -450,6 +457,58 @@ class TimetrackingEngine:
                 tickets[t]['descriptions'].append(e['description'])
         return result
 
+
+    # Matches the total annotation we inject at end of date line
+    _TOTAL_ANNOTATION_RE = re.compile(r'\s*\[[\d.,]+h\]$')
+
+    def inject_totals(self, content: str) -> str:
+        """
+        Rewrites each date-marker line to include the summed hours for that date.
+            --- 21.05.2026 ---  ->  --- 21.05.2026 --- [4.25h]
+        Existing annotations are replaced in-place. Returns modified content string.
+        """
+        # First pass: collect hours per date
+        hours_by_date: dict = {}
+        current_date_str = None
+        for raw in content.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            dm = self._DATE_RE.match(line)
+            if dm:
+                current_date_str = f"{dm.group(1)}.{dm.group(2)}.{dm.group(3)}"
+                if current_date_str not in hours_by_date:
+                    hours_by_date[current_date_str] = 0.0
+                continue
+            if current_date_str and self._TIME_RE.match(line):
+                tm = self._TIME_RE.match(line)
+                if tm:
+                    hours_by_date[current_date_str] += float(tm.group(1).replace(",", "."))
+
+        # Second pass: rewrite date-marker lines
+        out_lines = []
+        for raw in content.splitlines():
+            stripped = raw.strip()
+            dm = self._DATE_RE.match(stripped)
+            if dm:
+                date_str = f"{dm.group(1)}.{dm.group(2)}.{dm.group(3)}"
+                # Strip existing annotation, keep base "--- DD.MM.YYYY ---"
+                base = self._TOTAL_ANNOTATION_RE.sub("", stripped).rstrip()
+                total = hours_by_date.get(date_str, 0.0)
+                if total == int(total):
+                    total_str = f"{int(total)}h"
+                else:
+                    total_str = f"{total:.2f}h".rstrip("0")
+                leading = raw[: len(raw) - len(raw.lstrip())]
+                out_lines.append(f"{leading}{base} [{total_str}]")
+            else:
+                out_lines.append(raw)
+
+        result = "\n".join(out_lines)
+        if content.endswith("\n") and not result.endswith("\n"):
+            result += "\n"
+        return result
+
     def build_summary_text(self, tt_content: str, clients_content: str,
                            view_mode: str, nav_offset: int) -> str:
         """
@@ -548,6 +607,7 @@ class HistoryNotesApp(ctk.CTk):
         
         self._after_id_format = None
         self._after_id_save = None
+        self._after_id_totals = None
         self._sidebar_cache: dict = {}   # note_id -> NoteButton widget
         self._sidebar_order: list = []   # ordered list of currently visible note_ids
         self._sidebar_pinned_count: int = 0  # how many pinned notes are at the top of _sidebar_order
@@ -794,6 +854,35 @@ class HistoryNotesApp(ctk.CTk):
         if self._after_id_save: self.after_cancel(self._after_id_save)
         self._after_id_save = self.after(1000, self.auto_save)
         self.update_stats()
+        # Timetracking: refresh totals on date-header lines
+        if self.current_title_cache == self.TITLE_TT:
+            if self._after_id_totals: self.after_cancel(self._after_id_totals)
+            self._after_id_totals = self.after(800, self._refresh_tt_totals)
+
+    def _refresh_tt_totals(self):
+        """Inject per-date hour totals into the Timetracking note's date-marker lines."""
+        if not self.current_note_id or self.is_loading:
+            return
+        current = self.editor.get("0.0", "end-1c")
+        updated = self._tt_engine.inject_totals(current)
+        if updated == current:
+            return
+        # Save cursor position
+        try:
+            cursor_pos = self.editor._textbox.index("insert")
+        except Exception:
+            cursor_pos = "end"
+        self.is_loading = True
+        self.editor.delete("0.0", "end")
+        self.editor.insert("0.0", updated)
+        self.apply_markdown(full_scan=True)
+        self.is_loading = False
+        # Restore cursor
+        try:
+            self.editor._textbox.mark_set("insert", cursor_pos)
+            self.editor._textbox.see(cursor_pos)
+        except Exception:
+            pass
 
     def auto_save(self):
         if not self.current_note_id or self.is_loading: return
