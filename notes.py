@@ -224,14 +224,14 @@ class NoteVault:
         return box[0]
 
     def delete_note_soft(self, nid: int):
-        self._write("UPDATE note_list SET is_deleted = 1, pinned = 0 WHERE id = ?", (nid,))
+        self._write_sync("UPDATE note_list SET is_deleted = 1, pinned = 0 WHERE id = ?", (nid,))
 
     def delete_note_hard(self, nid: int):
-        self._write("DELETE FROM note_list WHERE id = ?", (nid,))
-        self._write("DELETE FROM history WHERE note_id = ?", (nid,))
+        self._write_sync("DELETE FROM note_list WHERE id = ?", (nid,))
+        self._write_sync("DELETE FROM history WHERE note_id = ?", (nid,))
 
     def restore_note(self, nid: int):
-        self._write("UPDATE note_list SET is_deleted = 0 WHERE id = ?", (nid,))
+        self._write_sync("UPDATE note_list SET is_deleted = 0 WHERE id = ?", (nid,))
 
     def toggle_pin(self, nid: int):
         self._write_sync("UPDATE note_list SET pinned = 1 - pinned WHERE id = ?", (nid,))
