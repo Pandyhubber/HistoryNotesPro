@@ -129,7 +129,10 @@ class NoteVault:
         evt = threading.Event()
         box: list = []
         self._write_queue.put((sql, params, evt, box))
-        evt.wait()
+        completed = evt.wait(timeout=5)
+        if not completed:
+            log.error("_write_sync timed out | sql=%s params=%s", sql, params)
+            return
         if box and isinstance(box[0], Exception):
             raise box[0]
 
@@ -298,6 +301,7 @@ class NoteButton(ctk.CTkFrame):
 
         self.btn = ctk.CTkButton(self, anchor="w", text="", fg_color="transparent", hover_color="gray30", command=lambda: select_cmd(note_id))
         self.btn.pack(side="left", fill="x", expand=True)
+        self._last_text = None  # tracked independently of CTk internals
         self.update_data(title, pinned)
 
         if not is_deleted:
@@ -311,9 +315,13 @@ class NoteButton(ctk.CTkFrame):
         menu.tk_popup(event.x_root, event.y_root)
 
     def update_data(self, title, pinned):
-        self._pinned = pinned
         display = (title if title and title.strip() else "...").replace("\n", " ")
-        self.btn.configure(text=f"{'📌 ' if pinned else ''}{display}")
+        new_text = f"{'📌 ' if pinned else ''}{display}"
+        if pinned == self._pinned and getattr(self, "_last_text", None) == new_text:
+            return  # nothing changed, skip unnecessary configure call
+        self._pinned = pinned
+        self._last_text = new_text
+        self.btn.configure(text=new_text)
 
 
 # ==========================================
@@ -684,7 +692,7 @@ class HistoryNotesApp(ctk.CTk):
         self.top_bar = ctk.CTkFrame(self.editor_container, fg_color="transparent")
         self.top_bar.grid(row=0, column=0, sticky="ew", pady=(0,5))
         
-        self.del_btn = ctk.CTkButton(self.top_bar, fg_color="#882222", width=140, command=self.handle_delete_action)
+        self.del_btn = ctk.CTkButton(self.top_bar, fg_color=self.CLR_BTN_DELETE, width=140, command=self.handle_delete_action)
         self.del_btn.pack(side="right")
         self.restore_btn = ctk.CTkButton(self.top_bar, fg_color="#228844", width=140, command=self.restore_note)
 
@@ -717,8 +725,8 @@ class HistoryNotesApp(ctk.CTk):
             text="📊 History",
             width=100,
             height=28,
-            fg_color="#2b5b84",
-            hover_color="#3a7ab5",
+            fg_color=self.CLR_BTN_TT_HISTORY,
+            hover_color=self.CLR_BTN_TT_HISTORY_HOVER,
             command=self.open_summary_history
         )
 
@@ -1042,18 +1050,18 @@ class HistoryNotesApp(ctk.CTk):
 
     def update_delete_button_state(self, is_deleted=None):
         if not self.current_note_id: 
-            self.del_btn.configure(text=self.get_str("del"), fg_color="#882222")
+            self.del_btn.configure(text=self.get_str("del"), fg_color=self.CLR_BTN_DELETE)
             self.restore_btn.pack_forget()
             return
         if is_deleted is None:
             res = self.vault.get_note(self.current_note_id)
             is_deleted = res[2] if res else 0
         if is_deleted == 1:
-            self.del_btn.configure(text=self.get_str("final_del"), fg_color="#FF0000")
+            self.del_btn.configure(text=self.get_str("final_del"), fg_color=self.CLR_BTN_DELETE_HARD)
             self.restore_btn.pack(side="right", padx=(0, 10))
             self.restore_btn.configure(text=self.get_str("restore"))
         else:
-            self.del_btn.configure(text=self.get_str("del"), fg_color="#882222")
+            self.del_btn.configure(text=self.get_str("del"), fg_color=self.CLR_BTN_DELETE)
             self.restore_btn.pack_forget()
 
     def apply_markdown(self, full_scan=False):
@@ -1084,8 +1092,11 @@ class HistoryNotesApp(ctk.CTk):
                 ("url",       r"\b(?:https?://)?(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?\b", 0),
             ]
             for tag, pattern, flag in simple_rules:
-                for m in re.finditer(pattern, content, flag):
-                    self.editor.tag_add(tag, f"{start_idx} + {m.start()} chars", f"{start_idx} + {m.end()} chars")
+                try:
+                    for m in re.finditer(pattern, content, flag):
+                        self.editor.tag_add(tag, f"{start_idx} + {m.start()} chars", f"{start_idx} + {m.end()} chars")
+                except Exception as e:
+                    log.debug("apply_markdown simple_rule error tag=%s: %s", tag, e)
 
             # Inner-text rules: apply style to group(1), elide the markers
             # Each tuple: (tag, open_marker_len, close_marker_len, compiled_regex)
@@ -1096,12 +1107,15 @@ class HistoryNotesApp(ctk.CTk):
             ]
             for tag, open_len, close_len, rx in inner_rules:
                 tb_ref = self.editor._textbox if tag == "bold_weight" else self.editor
-                for m in rx.finditer(content):
-                    inner_s = m.start(1)
-                    inner_e = m.end(1)
-                    tb_ref.tag_add(tag,          f"{start_idx} + {inner_s} chars", f"{start_idx} + {inner_e} chars")
-                    self.editor.tag_add("fmt_hidden", f"{start_idx} + {m.start()} chars", f"{start_idx} + {inner_s} chars")
-                    self.editor.tag_add("fmt_hidden", f"{start_idx} + {inner_e} chars",   f"{start_idx} + {m.end()} chars")
+                try:
+                    for m in rx.finditer(content):
+                        inner_s = m.start(1)
+                        inner_e = m.end(1)
+                        tb_ref.tag_add(tag,          f"{start_idx} + {inner_s} chars", f"{start_idx} + {inner_e} chars")
+                        self.editor.tag_add("fmt_hidden", f"{start_idx} + {m.start()} chars", f"{start_idx} + {inner_s} chars")
+                        self.editor.tag_add("fmt_hidden", f"{start_idx} + {inner_e} chars",   f"{start_idx} + {m.end()} chars")
+                except Exception as e:
+                    log.debug("apply_markdown inner_rule error tag=%s: %s", tag, e)
 
             # Colour tags: color inner text only, hide the [tag]...[/tag] markers
             for m in self._COLOR_TAG_RE.finditer(content):
@@ -1135,7 +1149,7 @@ class HistoryNotesApp(ctk.CTk):
 
     def toggle_archive_view(self):
         self.show_archived = not self.show_archived
-        self.archive_toggle_btn.configure(fg_color="#445566" if self.show_archived else "gray25")
+        self.archive_toggle_btn.configure(fg_color=self.CLR_ARCHIVE_ACTIVE if self.show_archived else self.CLR_ARCHIVE_IDLE)
         self.refresh_sidebar()
 
     def export_notes(self):
@@ -1309,6 +1323,15 @@ class HistoryNotesApp(ctk.CTk):
     # ==========================================
     TITLE_TT       = "Timetracking"
     TITLE_CLIENTS  = "Timetracking Clients"
+
+    # UI colour constants -- single source of truth
+    CLR_BTN_DELETE      = "#882222"
+    CLR_BTN_DELETE_HARD = "#FF0000"
+    CLR_BTN_TT_HISTORY  = "#2b5b84"
+    CLR_BTN_TT_HISTORY_HOVER = "#3a7ab5"
+    CLR_ARCHIVE_ACTIVE  = "#445566"
+    CLR_ARCHIVE_IDLE    = "gray25"
+    CLR_SIDEBAR_HOVER   = "gray30"
     CLIENTS_DEFAULT = "# One line per client: PREFIX = Client Name\n# Example:\n# MMS = MöbelMartin\n# LGIT = LGIT GmbH\n"
 
     def _ensure_special_notes(self):
