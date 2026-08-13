@@ -350,6 +350,9 @@ class TimetrackingEngine:
     _LOOKS_LIKE_ENTRY_RE = re.compile(r'^\d', re.IGNORECASE)
     # Date marker: --- DD.MM.YYYY --- (optionally followed by a total annotation)
     _DATE_RE = re.compile(r'^---\s*(\d{2})\.(\d{2})\.(\d{4})\s*---')
+    # Section header: ******TEXT****** (e.g. ******DIA TIMES******, ******ANT TIMES******).
+    # A bare ****** line also acts as a section separator.
+    _SECTION_RE = re.compile(r'^\*{6}(?:.*\*{6})?$')
     # Client mapping line: PREFIX = Name
     _CLIENT_RE = re.compile(r'^\s*([A-Z0-9]+)\s*=\s*(.+)$', re.IGNORECASE)
 
@@ -374,10 +377,17 @@ class TimetrackingEngine:
         entries = []
         warnings = []
         current_date = None
+        current_section = ''
 
         for lineno, raw in enumerate(tt_content.splitlines(), start=1):
             line = raw.strip()
             if not line:
+                continue
+
+            # Section header (******TEXT******): starts a new section.
+            # Entries below it belong to this section only.
+            if self._SECTION_RE.match(line):
+                current_section = line.strip('*').strip()
                 continue
 
             # Check for date marker
@@ -436,6 +446,7 @@ class TimetrackingEngine:
                 'ticket': ticket,
                 'hours': hours,
                 'description': description,
+                'section': current_section,
             })
 
         return entries, warnings
@@ -465,6 +476,37 @@ class TimetrackingEngine:
                 tickets[t]['descriptions'].append(e['description'])
         return result
 
+    def aggregate_by_section(self, entries: list, client_map: dict, filter_fn=None):
+        """
+        Like aggregate(), but groups entries by their section first.
+        A section is the text of the enclosing ******TEXT****** header ('' for
+        entries before the first header). Returns:
+            { section: { prefix: { 'name': str, 'tickets': {...} } } }
+        preserving the order in which sections first appear.
+        """
+        result = {}
+        for e in entries:
+            if filter_fn and not filter_fn(e):
+                continue
+            section = e.get('section', '')
+            if section not in result:
+                result[section] = {}
+            sec = result[section]
+            prefix = e['prefix']
+            if prefix not in sec:
+                sec[prefix] = {
+                    'name': client_map.get(prefix, f"Unknown ({prefix})"),
+                    'tickets': {}
+                }
+            tickets = sec[prefix]['tickets']
+            t = e['ticket']
+            if t not in tickets:
+                tickets[t] = {'hours': 0.0, 'descriptions': []}
+            tickets[t]['hours'] += e['hours']
+            if e['description']:
+                tickets[t]['descriptions'].append(e['description'])
+        return result
+
 
     # Matches the total annotation we inject at end of date line
     _TOTAL_ANNOTATION_RE = re.compile(r'\s*\[[\d.,]+h\]$')
@@ -474,35 +516,47 @@ class TimetrackingEngine:
         Rewrites each date-marker line to include the summed hours for that date.
             --- 21.05.2026 ---  ->  --- 21.05.2026 --- [4.25h]
         Existing annotations are replaced in-place. Returns modified content string.
+
+        Totals are computed per date-marker occurrence inside its own section.
+        A section is any block introduced by a ******TEXT****** header line
+        (e.g. ******DIA TIMES******, ******ANT TIMES******). A date marker only
+        sums the time entries listed below it within the same section, so the
+        same date can appear in several sections and each marker shows only its
+        own hours.
         """
-        # First pass: collect hours per date
-        hours_by_date: dict = {}
-        current_date_str = None
+        # First pass: collect hours per date-marker occurrence, within its section
+        slots = []     # one dict per date-marker line: {'hours': float}
+        current = None  # slot of the most recent date marker in this section
         for raw in content.splitlines():
             line = raw.strip()
             if not line:
                 continue
+            # A section header finalises the previous date marker: entries
+            # below it belong to the new section and must not leak into the
+            # previous marker's total.
+            if self._SECTION_RE.match(line):
+                current = None
+                continue
             dm = self._DATE_RE.match(line)
             if dm:
-                current_date_str = f"{dm.group(1)}.{dm.group(2)}.{dm.group(3)}"
-                if current_date_str not in hours_by_date:
-                    hours_by_date[current_date_str] = 0.0
+                current = {'hours': 0.0}
+                slots.append(current)
                 continue
-            if current_date_str and self._TIME_RE.match(line):
+            if current is not None:
                 tm = self._TIME_RE.match(line)
                 if tm:
-                    hours_by_date[current_date_str] += float(tm.group(1).replace(",", "."))
+                    current['hours'] += float(tm.group(1).replace(",", "."))
 
-        # Second pass: rewrite date-marker lines
+        # Second pass: rewrite date-marker lines, pairing each marker with its slot
         out_lines = []
+        slot_iter = iter(slots)
         for raw in content.splitlines():
             stripped = raw.strip()
             dm = self._DATE_RE.match(stripped)
             if dm:
-                date_str = f"{dm.group(1)}.{dm.group(2)}.{dm.group(3)}"
                 # Strip existing annotation, keep base "--- DD.MM.YYYY ---"
                 base = self._TOTAL_ANNOTATION_RE.sub("", stripped).rstrip()
-                total = hours_by_date.get(date_str, 0.0)
+                total = next(slot_iter, {'hours': 0.0})['hours']
                 if total == int(total):
                     total_str = f"{int(total)}h"
                 else:
@@ -554,7 +608,13 @@ class TimetrackingEngine:
             label = target_month.strftime('%B %Y')
             filter_fn = lambda e, s=target_month, en=period_end: s <= e['date'] <= en
 
-        aggregated = self.aggregate(entries, client_map, filter_fn)
+        # Group by section (******TEXT****** blocks) if the note uses them,
+        # otherwise keep the classic single global block.
+        use_sections = any(self._SECTION_RE.match(raw.strip()) for raw in tt_content.splitlines())
+        if use_sections:
+            aggregated_by_section = self.aggregate_by_section(entries, client_map, filter_fn)
+        else:
+            aggregated_by_section = {'': self.aggregate(entries, client_map, filter_fn)}
 
         lines = []
         lines.append(f"TIMETRACKING SUMMARY  —  {label}")
@@ -562,16 +622,22 @@ class TimetrackingEngine:
 
         total_hours = 0.0
 
-        for prefix, data in sorted(aggregated.items()):
-            client_total = sum(t['hours'] for t in data['tickets'].values())
-            total_hours += client_total
-            lines.append(f"── {data['name']} ({prefix}) " + "─" * max(2, 44 - len(data['name']) - len(prefix)))
-            for ticket, tdata in sorted(data['tickets'].items()):
-                desc_str = ' / '.join(dict.fromkeys(tdata['descriptions']))  # deduplicate, preserve order
-                desc_str = (desc_str[:50] + '…') if len(desc_str) > 50 else desc_str
-                lines.append(f"  {ticket:<18} {tdata['hours']:>5.1f}h   {desc_str}")
-            lines.append(f"  {'Client total:':<18} {client_total:>5.1f}h")
-            lines.append("")
+        for section, section_data in aggregated_by_section.items():
+            if use_sections:
+                section_label = section if section else "General"
+                lines.append(f"****** {section_label} ******")
+            for prefix, data in sorted(section_data.items()):
+                client_total = sum(t['hours'] for t in data['tickets'].values())
+                total_hours += client_total
+                lines.append(f"── {data['name']} ({prefix}) " + "─" * max(2, 44 - len(data['name']) - len(prefix)))
+                for ticket, tdata in sorted(data['tickets'].items()):
+                    desc_str = ' / '.join(dict.fromkeys(tdata['descriptions']))  # deduplicate, preserve order
+                    desc_str = (desc_str[:50] + '…') if len(desc_str) > 50 else desc_str
+                    lines.append(f"  {ticket:<18} {tdata['hours']:>5.1f}h   {desc_str}")
+                lines.append(f"  {'Client total:':<18} {client_total:>5.1f}h")
+                lines.append("")
+            if use_sections:
+                lines.append("")
 
         lines.append("═" * 48)
         lines.append(f"  {'TOTAL LOGGED:':<18} {total_hours:>5.1f}h")
