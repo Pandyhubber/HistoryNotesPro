@@ -93,6 +93,7 @@ class SaveTests(GuiCase):
 
         type_text(self.app, " and bread", at="end-1c")
         self.app.auto_save()
+        self.app.vault.flush()
         self.assertEqual(self.app.vault.get_history_count(nid), 2)
         self.assertEqual(self.app.vault.get_last_history_content(nid), "Buy 2.5h of milk today and bread")
 
