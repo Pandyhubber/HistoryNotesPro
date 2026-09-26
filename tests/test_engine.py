@@ -18,6 +18,23 @@ class HelperTests(unittest.TestCase):
         for value, expected in cases.items():
             self.assertEqual(notes.fmt_hours(value), expected, value)
 
+    def test_geometry_reachable(self):
+        # Fake monitors: laptop 0..1920 x 0..1080, second screen right of it 1920..3840
+        screens = [(0, 0, 1920, 1080), (1920, 0, 3840, 1080)]
+        on = lambda x, y: any(l <= x < r and t <= y < b for l, t, r, b in screens)  # noqa: E731
+        r = notes.geometry_reachable
+        self.assertTrue(r('1100x850+100+50', 1.0, on))
+        self.assertTrue(r('1100x850+2500+50', 1.0, on))      # on the second screen
+        self.assertFalse(r('1936x1096+-1959+37', 1.0, on))   # left monitor unplugged
+        self.assertFalse(r('1100x850+4000+50', 1.0, on))     # right of everything
+        self.assertFalse(r('1100x850+100+-400', 1.0, on))    # title bar above the screen
+        self.assertTrue(r('1100x850+-500+50', 1.0, on))      # left part off-screen, middle of title bar grabbable
+        self.assertFalse(r('1100x850+-500+50', 0.5, on))     # same, but at scaling 0.5 the middle is off-screen too
+        self.assertTrue(r('1100x850+-1000+50', 2.0, on))     # scaling widens the window into view
+        self.assertFalse(r('1100x850+-1000+50', 1.0, on))
+        for bad in ('', 'garbage', '1100x850', '+10+10'):
+            self.assertFalse(r(bad, 1.0, on), bad)
+
     def test_changed_chars(self):
         c = notes.changed_chars
         self.assertEqual(c('abc', 'abc'), 0)

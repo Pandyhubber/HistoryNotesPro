@@ -8,6 +8,7 @@ import json
 import webbrowser
 import sys
 import ctypes
+import ctypes.wintypes
 import logging
 import threading
 import queue
@@ -247,6 +248,34 @@ def safe_filename(title: str, used: set) -> str:
         n += 1
     used.add(name.casefold())
     return f"{name}.txt"
+
+
+_GEOMETRY_RE = re.compile(r'(\d+)x(\d+)\+(-?\d+)\+(-?\d+)')
+_TITLE_BAR_PROBE_Y = 10      # px below the window's top edge, inside the title bar
+_TITLE_BAR_PROBE_X = 60      # px in from the left edge, next to the icon
+
+
+def monitor_at(x: int, y: int) -> bool:
+    """True if the screen point lies on a connected monitor (Windows, all monitors incl. negative coordinates)."""
+    user32 = ctypes.windll.user32
+    user32.MonitorFromPoint.restype = ctypes.c_void_p
+    MONITOR_DEFAULTTONULL = 0
+    return bool(user32.MonitorFromPoint(ctypes.wintypes.POINT(x, y), MONITOR_DEFAULTTONULL))
+
+
+def geometry_reachable(geo: str, scaling: float, on_screen) -> bool:
+    """Is the title bar of a saved window geometry grabbable on the current monitors?
+
+    geo is CTk's geometry(): width/height divided by the DPI scaling, x/y in screen pixels.
+    A geometry saved with a monitor that is no longer connected fails, so the window
+    is not restored into the void.
+    """
+    m = _GEOMETRY_RE.fullmatch(geo or "")
+    if not m:
+        return False
+    width, _, x, y = map(int, m.groups())
+    probe_y = y + _TITLE_BAR_PROBE_Y
+    return any(on_screen(px, probe_y) for px in (x + _TITLE_BAR_PROBE_X, x + round(width * scaling) // 2))
 
 
 def _casefold(value):
@@ -928,9 +957,9 @@ class HistoryNotesApp(ctk.CTk):
         self.refresh_sidebar()
         self.load_latest_or_empty()
 
-        # Restore window geometry from last session
+        # Restore window geometry from last session, unless its monitor is gone
         saved_geo = self.vault.get_setting("window_geometry", "")
-        if saved_geo:
+        if saved_geo and geometry_reachable(saved_geo, self._get_window_scaling(), self._on_screen):
             try:
                 self.geometry(saved_geo)
             except Exception:
@@ -1607,6 +1636,13 @@ class HistoryNotesApp(ctk.CTk):
         m.add_command(label=s["help_syntax"], state="disabled")
         for label, syntax_str in s["help_syntax_items"]:
             m.add_command(label=f"{label:<22}{syntax_str}", state="disabled")
+
+    def _on_screen(self, x: int, y: int) -> bool:
+        try:
+            return monitor_at(x, y)
+        except Exception:
+            # No Win32: Tk only knows the primary screen
+            return 0 <= x < self.winfo_screenwidth() and 0 <= y < self.winfo_screenheight()
 
     def _on_app_close(self):
         """Flush pending edits before exit -- no keystrokes lost."""

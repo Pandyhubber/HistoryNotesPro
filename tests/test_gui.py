@@ -73,6 +73,22 @@ class StartupTests(GuiCase):
             self.app = make_app(self.dir)
         self.assertTrue(self.app._iconbitmap_method_called)
 
+    def reopen_with_saved_geometry(self, geo):
+        close_app(self.app)                        # closing saves the current geometry, so write after it
+        vault = notes.NoteVault(self.dir / 'notes_vault.db')
+        vault.set_setting('window_geometry', geo)
+        vault.close()
+        self.app = make_app(self.dir)
+
+    def test_geometry_from_disconnected_monitor_is_not_restored(self):
+        # Saved on a left-hand second monitor that is no longer there
+        self.reopen_with_saved_geometry('1936x1096+-1959+37')
+        self.assertFalse(self.app.geometry().endswith('+-1959+37'))
+
+    def test_geometry_on_connected_monitor_is_restored(self):
+        self.reopen_with_saved_geometry('900x600+120+80')
+        self.assertTrue(self.app.geometry().endswith('+120+80'))   # withdrawn in tests, so Tk reports its own size
+
 
 class SaveTests(GuiCase):
     def test_small_edits_are_saved_history_only_for_bigger_ones(self):
